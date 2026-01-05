@@ -151,7 +151,7 @@ def block_reduce_sum(val: Float32, shared: cute.Tensor,
 
 ## 3. Kernel Migration Details
 
-### 3.1 RMSNorm Forward
+### 3.1 RMSNorm Forward (Quack-Style Implementation)
 
 **Current CUDA Pattern**:
 ```cpp
@@ -161,61 +161,155 @@ __global__ void rmsnorm_kernel(floatX* out, float* rms_out,
                                int N, int C, float eps)
 ```
 
-**CuTe DSL Implementation**:
+**CuTe DSL Implementation (Following Quack Patterns)**:
+
 ```python
-@cute.kernel
-def rmsnorm_forward_kernel(
-    out: cute.Tensor,              # [N, C] bf16 output
-    rms_out: cute.Tensor,          # [N] float32 rms values (optional)
-    inp: cute.Tensor,              # [N, C] bf16 input  
-    weight: cute.Tensor,           # [C] bf16 weight
-    N: cutlass.Int32,
-    C: cutlass.Int32,
-    eps: cutlass.Float32,
-    output_rms: cutlass.Constexpr  # Compile-time flag
-):
-    BLOCK_SIZE = 512
+from quack.reduce import row_reduce
+from quack.copy_utils import tiled_copy_2d, predicate_k
+from quack.reduction_base import ReductionBase
+
+class RMSNorm(ReductionBase):
+    """RMSNorm kernel using Quack patterns for speed-of-light performance."""
     
-    # Thread/block indices
-    idx = cute.blockIdx.x
-    tid = cute.threadIdx.x
-    
-    if idx >= N:
-        return
-    
-    # Shared memory for warp reduction
-    num_warps = BLOCK_SIZE // 32
-    s_sum_sq = cute.shared_memory((num_warps,), Float32)
-    
-    # Get row pointers
-    x = inp[idx, :]
-    o = out[idx, :]
-    
-    # Phase 1: Compute sum of squares
-    thread_sum_sq = Float32(0.0)
-    for i in range(tid, C, BLOCK_SIZE):
-        val = cute.cast(Float32, x[i])
-        thread_sum_sq = thread_sum_sq + val * val
-    
-    # Block-level reduction
-    block_sum = block_reduce_sum(thread_sum_sq, s_sum_sq, tid, num_warps)
-    
-    # Compute RMS inverse
-    if tid == 0:
-        rms = cute.sqrt(block_sum / cute.cast(Float32, C) + eps)
-        rms_inv = 1.0 / rms
-        s_sum_sq[0] = rms_inv
-        if cutlass.const_expr(output_rms):
-            rms_out[idx] = rms
-    cute.syncthreads()
-    
-    rms_inv = s_sum_sq[0]
-    
-    # Phase 2: Normalize and scale
-    for i in range(tid, C, BLOCK_SIZE):
-        val = cute.cast(Float32, x[i])
-        w = cute.cast(Float32, weight[i])
-        o[i] = cute.cast(BFloat16, val * rms_inv * w)
+    def __init__(self, dtype: Type[cutlass.Numeric], N: int):
+        super().__init__(dtype, N, stage=1)  # Single stage for RMSNorm
+        self.reload_from = None if N <= 8192 else "smem"  # Reload strategy for large N
+
+    def _threads_per_row(self):
+        """Select optimal threads per row based on reduction dimension."""
+        N = self.N
+        for limit, threads in [(64, 8), (128, 16), (3072, 32), (6144, 64), (16384, 128)]:
+            if N <= limit:
+                return threads
+        return 256
+
+    @cute.jit
+    def __call__(
+        self,
+        mX: cute.Tensor,           # [B, N] input
+        mW: Optional[cute.Tensor], # [N] weight
+        mO: cute.Tensor,           # [B, N] output
+        mRstd: Optional[cute.Tensor],  # [B] rstd output
+        eps: Float32,
+        stream: cuda.CUstream,
+    ):
+        self._set_cluster_n()
+        largest_dtype_width = max(t.element_type.width for t in [mX, mW, mO] if t is not None)
+        vecsize = math.gcd(self.N, 128 // largest_dtype_width)
+        tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=vecsize)
+        
+        self.kernel(mX, mW, mO, mRstd, eps, tiler_mn, tiled_copy, threads_per_row).launch(
+            grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
+            block=[tiled_copy.size, 1, 1],
+            cluster=[1, self.cluster_n, 1] if self.cluster_n > 1 else None,
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mX: cute.Tensor,
+        mW: Optional[cute.Tensor],
+        mO: cute.Tensor,
+        mRstd: Optional[cute.Tensor],
+        eps: Float32,
+        tiler_mn: cute.Shape,
+        tiled_copy: cute.TiledCopy,
+        threads_per_row: cutlass.Constexpr[int],
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        cluster_y = cute.arch.block_idx()[1] if self.cluster_n > 1 else 0
+        tv_layout = tiled_copy.layout_tv_tiled
+
+        # Allocate shared memory
+        smem = cutlass.utils.SmemAllocator()
+        sX = smem.allocate_tensor(
+            mX.element_type, 
+            cute.make_ordered_layout(tiler_mn, order=(1, 0)), 
+            byte_alignment=16
+        )
+        reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
+
+        shape = mX.shape
+        idX = cute.make_identity_tensor(shape)
+        
+        # Partition for this CTA
+        gX, gO, gRstd, cX = [
+            cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) if mT is not None else None
+            for mT in (mX, mO, mRstd, idX)
+        ]
+        gW = cute.local_tile(mW, tiler_mn, (0, cluster_y)) if mW is not None else None
+
+        thr_copy_X = tiled_copy.get_slice(tidx)
+        
+        # Partition tensors for this thread
+        tXgW = thr_copy_X.partition_S(gW) if mW is not None else None
+        tXgX = thr_copy_X.partition_S(gX)
+        tXsX = thr_copy_X.partition_D(sX)
+        tXgO = thr_copy_X.partition_D(gO)
+        tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
+        
+        # Allocate register fragments
+        tXrW = cute.make_fragment_like(tXgW) if mW is not None else None
+        tXrX, tXrO = [cute.make_fragment_like(t) for t in (tXgX, tXgO)]
+
+        # Initialize cluster if needed
+        num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
+        self._initialize_cluster(tidx, mbar_ptr, num_warps)
+
+        # Handle uneven dimensions
+        is_even_N = shape[1] == tiler_mn[1] * self.cluster_n
+        tXpX = predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
+        copy = partial(copy_utils.copy, pred=tXpX)
+
+        row = tXcX[0][0]
+        if row < shape[0]:
+            copy(tXgX, tXsX, is_async=True)
+        cute.arch.cp_async_commit_group()
+
+        # Load weights while waiting for data
+        if mW is not None:
+            copy(tXgW, tXrW)
+
+        cute.arch.cp_async_wait_group(0)
+        cute.autovec_copy(tXsX, tXrX)
+        x = tXrX.load().to(cute.Float32)
+
+        # Compute sum of squares with row reduction (supports cluster for large N)
+        sum_sq_x = row_reduce(
+            x * x,
+            cute.ReductionOp.ADD,
+            threads_per_row,
+            reduction_buffer[None, None, 0],
+            mbar_ptr,
+            init_val=0.0,
+            hook_fn=cute.arch.cluster_wait if self.cluster_n > 1 else None,
+        )
+        
+        # Compute rstd
+        rstd = cute.math.rsqrt(sum_sq_x / shape[1] + eps, fastmath=True)
+        
+        # Store rstd if requested
+        if mRstd is not None:
+            if tXcX[0][1] == 0 and row < shape[0]:
+                if self.cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0:
+                    thr_copy_X.partition_D(gRstd)[0] = rstd
+
+        # Reload x if needed for large N
+        if self.reload_from == "smem":
+            cute.autovec_copy(tXsX, tXrX)
+            x = tXrX.load().to(cute.Float32)
+
+        # Normalize and apply weight
+        o = x * rstd
+        if mW is not None:
+            w = tXrW.load().to(cute.Float32)
+            o = o * w
+        
+        tXrO.store(o.to(tXrO.element_type))
+        if row < shape[0]:
+            copy(tXrO, tXgO)
 ```
 
 ### 3.2 Sinkhorn-Knopp Forward
@@ -324,325 +418,791 @@ def stream_aggregate_kernel(
 
 ---
 
-## 4. Reusable Components
+## 4. Reusable Components (Quack-Style)
 
-### 4.1 Core Primitives Library
+### 4.1 Core Utilities Module (`utils.py`)
 
-Create `cute_dsl/primitives.py`:
+Adapted from `quack/utils.py`:
 
 ```python
-"""Reusable CUDA primitives for CuTe DSL kernels."""
+"""Core utilities for CuTe DSL kernels - adapted from Quack."""
+
+from functools import partial
+from typing import Optional, Tuple
 
 import cutlass
-from cutlass import cute
+import cutlass.cute as cute
+from cutlass import Float32, Int32, const_expr
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm, nvvm, vector
 
-# ============ Constants ============
-WARP_SIZE = cutlass.Constexpr[int](32)
+# Packed f32 operations with proper rounding
+fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
+mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
+add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
 
-# ============ Device Functions ============
-
-@cute.jit
-def fast_exp(x: cutlass.Float32) -> cutlass.Float32:
-    """Fast exponential using CUDA intrinsic."""
-    return cute.exp(x)  # Maps to __expf
-
-@cute.jit
-def fast_sigmoid(x: cutlass.Float32) -> cutlass.Float32:
-    """Fast sigmoid: 1/(1+exp(-x))."""
-    return cute.frcp(1.0 + fast_exp(-x))
+@dsl_user_op
+def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+    """Get pointer to element at coordinate in tensor."""
+    return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
 
 @cute.jit
-def fast_reciprocal(x: cutlass.Float32) -> cutlass.Float32:
-    """Fast reciprocal using CUDA intrinsic."""
-    return cute.frcp(x)  # Maps to __frcp_rn
+def load_scalar_or_pointer(x: Float32 | cute.Pointer) -> Float32:
+    """Load scalar value or dereference pointer."""
+    if const_expr(isinstance(x, cute.Pointer)):
+        return Float32(cute.make_tensor(x, cute.make_layout(1))[0])
+    else:
+        return x
 
-# ============ Reduction Primitives ============
+@dsl_user_op
+def set_block_rank(
+    smem_ptr: cute.Pointer, 
+    peer_cta_rank_in_cluster: Int32, 
+    *, loc=None, ip=None
+) -> Int32:
+    """Map smem pointer to address at another CTA rank in cluster."""
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    return Int32(llvm.inline_asm(
+        T.i32(),
+        [smem_ptr_i32, peer_cta_rank_in_cluster.ir_value()],
+        "mapa.shared::cluster.u32 $0, $1, $2;",
+        "=r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    ))
 
-@cute.jit
-def warp_reduce_sum(val: cutlass.Float32) -> cutlass.Float32:
-    """Butterfly warp reduction for sum."""
-    for i in cutlass.range_constexpr(5):
-        offset = 16 >> i
-        val = val + cute.shfl_xor(val, offset)
-    return val
-
-@cute.jit
-def warp_reduce_max(val: cutlass.Float32) -> cutlass.Float32:
-    """Butterfly warp reduction for max."""
-    for i in cutlass.range_constexpr(5):
-        offset = 16 >> i
-        other = cute.shfl_xor(val, offset)
-        val = cute.max(val, other)
-    return val
-
-# ============ Memory Utilities ============
-
-@cute.jit
-def load_vectorized_bf16_to_f32(
-    src: cute.Tensor,  # bf16 tensor
-    dst_ptr,           # f32 destination  
-    idx: cutlass.Int32,
-    vec_size: cutlass.Constexpr
+@dsl_user_op
+def store_shared_remote(
+    val: float | Float32 | Int32,
+    smem_ptr: cute.Pointer,
+    mbar_ptr: cute.Pointer,
+    peer_cta_rank_in_cluster: cute.typing.Int,
+    *, loc=None, ip=None,
 ) -> None:
-    """Load bf16 elements and convert to f32."""
-    for i in cutlass.range_constexpr(vec_size):
-        dst_ptr[i] = cute.cast(cutlass.Float32, src[idx + i])
+    """Store to another CTA's shared memory via distributed shared memory."""
+    remote_smem_ptr_i32 = set_block_rank(smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
+    remote_mbar_ptr_i32 = set_block_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
+    
+    if const_expr(isinstance(val, float)):
+        val = Float32(val)
+    suffix = {Float32: "f32", Int32: "s32"}[type(val)]
+    constraint = {Float32: "f", Int32: "r"}[type(val)]
+    
+    llvm.inline_asm(
+        None,
+        [remote_smem_ptr_i32, val.ir_value(loc=loc, ip=ip), remote_mbar_ptr_i32],
+        f"st.async.shared::cluster.mbarrier::complete_tx::bytes.{suffix} [$0], $1, [$2];",
+        f"r,{constraint},r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+@dsl_user_op
+def f32x2_to_i64(a: Float32, b: Float32, *, loc=None, ip=None) -> cutlass.Int64:
+    """Pack two f32 values into i64 for efficient smem transfers."""
+    vec_f32x2 = vector.from_elements(T.vector(2, T.f32()), (a.ir_value(), b.ir_value()), loc=loc, ip=ip)
+    vec_i64x1 = vector.bitcast(T.vector(1, T.i64()), vec_f32x2)
+    return cutlass.Int64(vector.extract(vec_i64x1, dynamic_position=[], static_position=[0], loc=loc, ip=ip))
+
+@dsl_user_op
+def i64_to_f32x2(c: cutlass.Int64, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    """Unpack i64 back to two f32 values."""
+    vec_i64x1 = vector.from_elements(T.vector(1, T.i64()), (c.ir_value(),), loc=loc, ip=ip)
+    vec_f32x2 = vector.bitcast(T.vector(2, T.f32()), vec_i64x1)
+    res0 = Float32(vector.extract(vec_f32x2, dynamic_position=[], static_position=[0], loc=loc, ip=ip))
+    res1 = Float32(vector.extract(vec_f32x2, dynamic_position=[], static_position=[1], loc=loc, ip=ip))
+    return res0, res1
+
+@cute.jit
+def fill_oob(tXsX: cute.Tensor, tXpX: Optional[cute.Tensor], fill_value: cute.Numeric) -> None:
+    """Fill out-of-bounds values in shared memory tensor."""
+    tXrX_fill = cute.make_fragment_like(tXsX[(None, 0), None, 0])
+    tXrX_fill.fill(fill_value)
+    for rest_v in cutlass.range_constexpr(tXsX.shape[0][1]):
+        for rest_k in cutlass.range_constexpr(tXsX.shape[2]):
+            if const_expr(tXpX is not None):
+                if not tXpX[rest_v, 0, rest_k]:
+                    cute.autovec_copy(tXrX_fill, tXsX[(None, rest_v), None, rest_k])
+            else:
+                cute.autovec_copy(tXrX_fill, tXsX[(None, rest_v), None, rest_k])
+
+@dsl_user_op
+def atomic_add_i32(a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    """Atomic add for int32."""
+    return nvvm.atomicrmw(res=T.i32(), op=nvvm.AtomicOpKind.ADD, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value())
 ```
 
-### 4.2 Block Reduction Module
+### 4.2 Reduction Module (`reduce.py`)
 
-Create `cute_dsl/reductions.py`:
+Adapted from `quack/reduce.py`:
 
 ```python
-"""Block-level reduction operations."""
+"""Reduction operations - adapted from Quack."""
+
+import math
+import operator
+from typing import Callable, Optional
 
 import cutlass
-from cutlass import cute
-from .primitives import warp_reduce_sum, WARP_SIZE
+import cutlass.cute as cute
+from cutlass import Int32, Float32, const_expr
+
+from .utils import elem_pointer, store_shared_remote, f32x2_to_i64, i64_to_f32x2
 
 @cute.jit
-def block_reduce_sum_2level(
-    val: cutlass.Float32,
-    smem: cute.Tensor,
-    tid: cutlass.Int32,
-    block_size: cutlass.Constexpr
-) -> cutlass.Float32:
+def block_reduce(
+    val: cute.Numeric, 
+    op: Callable, 
+    reduction_buffer: cute.Tensor, 
+    init_val: cute.Numeric = 0.0
+) -> cute.Numeric:
+    """Block reduction via shared memory.
+    
+    Args:
+        val: Per-thread value to reduce
+        op: Reduction operator (add, max, etc.)
+        reduction_buffer: Shared memory buffer shape (num_warps/warps_per_row, warps_per_row)
+        init_val: Initial value for reduction
     """
-    Two-level block reduction:
-    1. Intra-warp reduction using shuffle
-    2. Inter-warp reduction via shared memory
+    lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
+    warps_per_row = cute.size(reduction_buffer.shape[1])
+    row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
     
-    Returns the reduced sum (valid only in thread 0).
-    """
-    num_warps = block_size // WARP_SIZE
-    warp_id = tid // WARP_SIZE
-    lane_id = tid % WARP_SIZE
+    if lane_idx == 0:
+        reduction_buffer[row_idx, col_idx] = val
+    cute.arch.barrier()
     
-    # Level 1: Warp reduction
-    warp_sum = warp_reduce_sum(val)
-    
-    # Write warp results to shared memory
-    if lane_id == 0:
-        smem[warp_id] = warp_sum
-    cute.syncthreads()
-    
-    # Level 2: Final reduction in first warp
-    if warp_id == 0:
-        val = smem[lane_id] if lane_id < num_warps else 0.0
-        return warp_reduce_sum(val)
-    return 0.0
+    block_reduce_val = init_val
+    if lane_idx < warps_per_row:
+        block_reduce_val = reduction_buffer[row_idx, lane_idx]
+    return cute.arch.warp_reduction(block_reduce_val, op)
 
 @cute.jit
-def block_reduce_sum_broadcast(
-    val: cutlass.Float32,
-    smem: cute.Tensor,
-    tid: cutlass.Int32,
-    block_size: cutlass.Constexpr
-) -> cutlass.Float32:
-    """
-    Block reduction with result broadcast to all threads.
-    Uses smem[0] to store and broadcast the final result.
-    """
-    result = block_reduce_sum_2level(val, smem, tid, block_size)
+def cluster_reduce(
+    val: cute.Numeric,
+    op: Callable,
+    reduction_buffer: cute.Tensor,
+    mbar_ptr: cute.Pointer,
+    init_val: cute.Numeric = 0.0,
+    phase: Optional[Int32] = None,
+) -> cute.Numeric:
+    """Cluster reduction via distributed shared memory.
     
-    if tid == 0:
-        smem[0] = result
-    cute.syncthreads()
+    Args:
+        val: Per-thread value to reduce
+        op: Reduction operator
+        reduction_buffer: Shape (num_warps/warps_per_row, (warps_per_row, cluster_n))
+        mbar_ptr: Memory barrier pointer
+        init_val: Initial value
+        phase: Barrier phase
+    """
+    cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
+    lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
+    rows_per_block, (warps_per_row, cluster_n) = reduction_buffer.shape
+    row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
     
-    return smem[0]
+    if warp_idx == 0:
+        with cute.arch.elect_one():
+            num_warps = rows_per_block * warps_per_row
+            cute.arch.mbarrier_arrive_and_expect_tx(
+                mbar_ptr,
+                num_warps * cluster_n * reduction_buffer.element_type.width // 8,
+            )
+    
+    if lane_idx < cluster_n:
+        store_shared_remote(
+            val,
+            elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
+            mbar_ptr,
+            peer_cta_rank_in_cluster=lane_idx,
+        )
+    
+    cute.arch.mbarrier_wait(mbar_ptr, phase=phase if phase is not None else 0)
+    
+    block_reduce_val = init_val
+    num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
+    for i in cutlass.range_constexpr(num_iter):
+        idx = lane_idx + i * cute.arch.WARP_SIZE
+        if idx < cute.size(reduction_buffer, mode=[1]):
+            block_reduce_val = op(block_reduce_val, reduction_buffer[row_idx, idx])
+    
+    return cute.arch.warp_reduction(block_reduce_val, op)
+
+@cute.jit
+def row_reduce(
+    x: cute.TensorSSA | cute.Numeric,
+    op: cute.ReductionOp,
+    threads_per_row: cutlass.Constexpr[int],
+    reduction_buffer: Optional[cute.Tensor] = None,
+    mbar_ptr: Optional[cute.Pointer] = None,
+    phase: Optional[Int32] = None,
+    init_val: cute.Numeric = 0.0,
+    hook_fn: Optional[Callable] = None,
+) -> cute.Numeric:
+    """Unified row reduction supporting warp, block, and cluster levels.
+    
+    Args:
+        x: Input tensor or scalar
+        op: Reduction operation (ADD, MAX, MIN, MUL)
+        threads_per_row: Number of threads participating per row
+        reduction_buffer: Shared memory for block/cluster reduction
+        mbar_ptr: Memory barrier for cluster reduction
+        phase: Barrier phase
+        init_val: Initial value
+        hook_fn: Hook function called between warp and block reduction
+    """
+    if const_expr(isinstance(x, cute.TensorSSA)):
+        val = x.reduce(op, init_val=init_val, reduction_profile=0)
+    else:
+        val = x
+    
+    warp_op = {
+        cute.ReductionOp.ADD: operator.add,
+        cute.ReductionOp.MAX: cute.arch.fmax if const_expr(x.dtype == Float32) else max,
+        cute.ReductionOp.MIN: min,
+        cute.ReductionOp.MUL: operator.mul,
+    }[op]
+    
+    val = cute.arch.warp_reduction(
+        val, warp_op, 
+        threads_in_group=min(threads_per_row, cute.arch.WARP_SIZE)
+    )
+    
+    if const_expr(hook_fn is not None):
+        hook_fn()
+    
+    if const_expr(reduction_buffer is not None):
+        warps_per_row, cluster_n = reduction_buffer.shape[1]
+        if const_expr(warps_per_row > 1 or cluster_n > 1):
+            if const_expr(mbar_ptr is None):
+                val = block_reduce(val, warp_op, reduction_buffer, init_val=init_val)
+            else:
+                val = cluster_reduce(val, warp_op, reduction_buffer, mbar_ptr, 
+                                    phase=phase, init_val=init_val)
+    return val
 ```
 
-### 4.3 Type Conversion Module
+### 4.3 Copy Utilities Module (`copy_utils.py`)
 
-Create `cute_dsl/conversions.py`:
+Adapted from `quack/copy_utils.py`:
 
 ```python
-"""Data type conversion utilities."""
+"""Copy and memory utilities - adapted from Quack."""
+
+from typing import Optional, Type
+from functools import partial
 
 import cutlass
-from cutlass import cute
+import cutlass.cute as cute
+from cutlass import Int32, Boolean, const_expr
+from cutlass.cute.nvgpu import cpasync
 
-@cute.kernel
-def bf16_to_f32_kernel(
-    out: cute.Tensor,   # Float32 output
-    inp: cute.Tensor,   # BFloat16 input
-    size: cutlass.Int32
-):
-    """Element-wise bf16 to f32 conversion."""
-    BLOCK_SIZE = 256
-    idx = cute.blockIdx.x * BLOCK_SIZE + cute.threadIdx.x
-    if idx < size:
-        out[idx] = cute.cast(cutlass.Float32, inp[idx])
-
-@cute.kernel
-def f32_to_bf16_kernel(
-    out: cute.Tensor,   # BFloat16 output
-    inp: cute.Tensor,   # Float32 input
-    size: cutlass.Int32
-):
-    """Element-wise f32 to bf16 conversion."""
-    BLOCK_SIZE = 256
-    idx = cute.blockIdx.x * BLOCK_SIZE + cute.threadIdx.x
-    if idx < size:
-        out[idx] = cute.cast(cutlass.BFloat16, inp[idx])
-
-# Host-side launchers
 @cute.jit
-def bf16_to_f32(out: cute.Tensor, inp: cute.Tensor, size: int):
-    """Launch bf16->f32 conversion kernel."""
-    BLOCK_SIZE = 256
-    grid = (size + BLOCK_SIZE - 1) // BLOCK_SIZE
-    bf16_to_f32_kernel[grid, BLOCK_SIZE](out, inp, size)
+def load_s2r(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    """Load from shared memory to registers."""
+    dst = cute.make_fragment_like(src, src.element_type, loc=loc, ip=ip)
+    cute.autovec_copy(src, dst, loc=loc, ip=ip)
+    return dst
 
-@cute.jit  
-def f32_to_bf16(out: cute.Tensor, inp: cute.Tensor, size: int):
-    """Launch f32->bf16 conversion kernel."""
-    BLOCK_SIZE = 256
-    grid = (size + BLOCK_SIZE - 1) // BLOCK_SIZE
-    f32_to_bf16_kernel[grid, BLOCK_SIZE](out, inp, size)
+def tiled_copy_1d(
+    dtype: Type[cutlass.Numeric], 
+    num_threads: int, 
+    num_copy_elems: int = 1, 
+    is_async: bool = False
+) -> cute.TiledCopy:
+    """Create 1D tiled copy pattern."""
+    num_copy_bits = num_copy_elems * dtype.width
+    copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
+    copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
+    thr_layout = cute.make_layout(num_threads)
+    val_layout = cute.make_layout(num_copy_elems)
+    return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+
+def tiled_copy_2d(
+    dtype: Type[cutlass.Numeric],
+    threads_per_row: int,
+    num_threads: int,
+    num_copy_elems: int = 1,
+    is_async: bool = False,
+) -> cute.TiledCopy:
+    """Create 2D tiled copy for row-major data with vectorized loads."""
+    num_copy_bits = num_copy_elems * dtype.width
+    copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
+    copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
+    assert num_threads % threads_per_row == 0
+    thr_layout = cute.make_ordered_layout(
+        (num_threads // threads_per_row, threads_per_row),
+        order=(1, 0),
+    )
+    val_layout = cute.make_layout((1, num_copy_elems))
+    return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+
+@cute.jit
+def predicate_k(tAcA: cute.Tensor, limit: Int32) -> cute.Tensor:
+    """Compute predicates for K-dimension bounds checking."""
+    tApA = cute.make_fragment(
+        cute.make_layout(
+            (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
+            stride=(cute.size(tAcA, mode=[2]), 0, 1),
+        ),
+        Boolean,
+    )
+    for rest_v in cutlass.range_constexpr(tApA.shape[0]):
+        for rest_k in cutlass.range_constexpr(tApA.shape[2]):
+            tApA[rest_v, 0, rest_k] = cute.elem_less(tAcA[(0, rest_v), 0, rest_k][1], limit)
+    return tApA
+
+def copy(
+    src: cute.Tensor,
+    dst: cute.Tensor,
+    *,
+    pred: Optional[cute.Tensor] = None,
+    is_async: bool = False,
+    **kwargs,
+) -> None:
+    """Generic copy with optional predication and async support."""
+    num_copy_elems = src.shape[0][0]
+    num_copy_bits = min(128, num_copy_elems * src.element_type.width)
+    copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
+    copy_atom = cute.make_copy_atom(copy_op, src.element_type, num_bits_per_copy=num_copy_bits)
+    cute.copy(copy_atom, src, dst, pred=pred, **kwargs)
+```
+
+### 4.4 Fast Math Module (`fast_math.py`)
+
+Adapted from `quack/fast_math.py`:
+
+```python
+"""Fast math utilities - adapted from Quack."""
+
+from dataclasses import dataclass
+from typing import Tuple
+
+import cutlass
+import cutlass.cute as cute
+from cutlass import Int32, Uint32
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
+
+from .cute_dsl_utils import ParamsBase
+
+@cute.jit
+def clz(x: Int32) -> Int32:
+    """Count leading zeros."""
+    res = Int32(32)
+    done = False
+    for i in cutlass.range(32):
+        if ((1 << (31 - i)) & x) and not done:
+            res = Int32(i)
+            done = True
+    return res
+
+def find_log2(x: Int32) -> Int32:
+    """Find log2 rounded up."""
+    a = Int32(31 - clz(x))
+    return a + ((x & (x - 1)) != 0)
+
+@dsl_user_op
+def umulhi(a: Int32, b: Int32, *, loc=None, ip=None) -> Uint32:
+    """Unsigned multiply high - returns high 32 bits of 64-bit product."""
+    return Uint32(llvm.inline_asm(
+        T.i32(),
+        [Int32(a).ir_value(loc=loc, ip=ip), Int32(b).ir_value(loc=loc, ip=ip)],
+        "mul.hi.u32 $0, $1, $2;",
+        "=r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    ))
+
+@dataclass
+class FastDivmod(ParamsBase):
+    """Fast integer division using multiply-shift technique.
+    
+    Precompute division parameters on host, then use fast multiply-shift on device.
+    """
+    divisor: Int32
+    multiplier: Uint32
+    shift_right: Uint32
+
+    @staticmethod
+    def create(divisor: Int32) -> "FastDivmod":
+        """Precompute fast divmod parameters (call on host)."""
+        p = Uint32(31 + find_log2(divisor))
+        divisor_u32 = Uint32(divisor)
+        multiplier = Uint32(((cutlass.Uint64(1) << p) + divisor_u32 - 1) // divisor_u32)
+        shift_right = Uint32(p - 32)
+        return FastDivmod(divisor, multiplier, shift_right)
+
+    @cute.jit
+    def div(self, dividend: Int32) -> Int32:
+        """Fast division on device."""
+        return Int32(umulhi(dividend, self.multiplier) >> self.shift_right) \
+               if self.divisor != 1 else dividend
+
+    def divmod(self, dividend: Int32) -> Tuple[Int32, Int32]:
+        """Fast divmod on device."""
+        quotient = self.div(dividend)
+        remainder = dividend - quotient * self.divisor
+        return quotient, remainder
+```
+
+### 4.5 Reduction Base Class (`base.py`)
+
+Adapted from `quack/reduction_base.py`:
+
+```python
+"""Base class for reduction kernels - adapted from Quack."""
+
+from typing import Type, Tuple, Optional
+
+import cutlass
+import cutlass.cute as cute
+from cutlass import Int32, Int64, Float32, const_expr
+
+from . import copy_utils
+
+class ReductionBase:
+    """Base class for reduction kernels (RMSNorm, Softmax, etc.)."""
+    
+    def __init__(self, dtype: Type[cutlass.Numeric], N: int, stage: int = 1, 
+                 reduction_dtype=Float32):
+        self.dtype = dtype
+        self.N = N
+        self.stage = stage  # For double-buffering (LayerNorm needs 2)
+        self.reduction_dtype = reduction_dtype
+        self.cluster_n = 1
+
+    def _threads_per_row(self) -> int:
+        """Select optimal threads per row based on reduction dimension N."""
+        raise NotImplementedError()
+
+    def _num_threads(self) -> int:
+        """Select total thread count."""
+        return 128 if self.N <= 16384 else 256
+
+    def _set_cluster_n(self):
+        """Set cluster size based on N (for distributed shared memory reduction)."""
+        self.cluster_n = 1  # Override in subclass for large N
+
+    def _get_tiled_copy(self, vecsize: int = 1):
+        """Create tiled copy configuration for this kernel."""
+        assert self.N % vecsize == 0
+        threads_per_row = self._threads_per_row()
+        num_threads = self._num_threads()
+        assert num_threads % cute.arch.WARP_SIZE == 0
+        
+        num_blocks_N = cute.ceil_div(self.N // vecsize, threads_per_row * self.cluster_n)
+        tiler_mn = (num_threads // threads_per_row, vecsize * num_blocks_N * threads_per_row)
+        tiled_copy = copy_utils.tiled_copy_2d(self.dtype, threads_per_row, num_threads, vecsize)
+        return tiled_copy, tiler_mn, threads_per_row
+
+    def _get_reduction_buffer_layout(self, tv_layout: cute.Layout, cluster_n: int):
+        """Compute reduction buffer layout based on thread-value layout."""
+        num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
+        warps_per_row = (
+            num_warps if cute.rank(tv_layout.shape[0]) == 1 
+            else max(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
+        )
+        return cute.make_ordered_layout(
+            (num_warps // warps_per_row, (warps_per_row, cluster_n), self.stage),
+            order=(1, 0, 2),
+        )
+
+    def _allocate_reduction_buffer_and_mbar(
+        self, 
+        smem: cutlass.utils.SmemAllocator, 
+        tv_layout: cute.Layout
+    ) -> Tuple[cute.Tensor, Optional[cute.Pointer]]:
+        """Allocate reduction buffer and optional cluster barrier."""
+        reduction_buffer = smem.allocate_tensor(
+            self.reduction_dtype,
+            self._get_reduction_buffer_layout(tv_layout, self.cluster_n),
+            byte_alignment=8,
+        )
+        if const_expr(self.cluster_n > 1):
+            mbar_ptr = smem.allocate_array(Int64, num_elems=self.stage)
+        else:
+            mbar_ptr = None
+        return reduction_buffer, mbar_ptr
+
+    @cute.jit
+    def _initialize_cluster(self, tidx: Int32, mbar_ptr: cute.Pointer, num_warps: int):
+        """Initialize cluster barriers if using distributed shared memory."""
+        if const_expr(self.cluster_n > 1):
+            if tidx < self.stage:
+                cute.arch.mbarrier_init(mbar_ptr + tidx, 1)
+            cute.arch.mbarrier_init_fence()
+            cute.arch.cluster_arrive_relaxed()
 ```
 
 ---
 
-## 5. PyTorch Integration Strategy
+## 5. PyTorch Integration Strategy (Quack-Style)
 
-### 5.1 Autograd Function Pattern
+### 5.1 Kernel Compilation with Caching
+
+Following Quack's pattern, use `cute.compile` with fake tensors and cache compiled kernels:
 
 ```python
-"""PyTorch integration for CuTe DSL kernels."""
+"""PyTorch integration for CuTe DSL kernels - following Quack pattern."""
+
+import math
+from typing import Optional, Tuple
 
 import torch
+from torch import Tensor
+import cutlass
+import cutlass.cute as cute
+from cutlass import Float32
+
+from .cute_dsl.rmsnorm import RMSNorm
+from .cute_dsl.compile_utils import make_fake_tensor as fake_tensor
+from .cute_dsl.cute_dsl_utils import torch2cute_dtype_map
+
+# Dtype mapping
+torch2cute_dtype_map = {
+    torch.float16: cutlass.Float16,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float32: cutlass.Float32,
+    torch.int32: cutlass.Int32,
+    torch.int64: cutlass.Int64,
+}
+
+def _rmsnorm_fwd(
+    x: Tensor,
+    weight: Optional[Tensor],
+    out: Tensor,
+    rstd: Optional[Tensor],
+    eps: float,
+):
+    """Internal forward implementation with compilation caching."""
+    B, N = x.shape
+    dtype = torch2cute_dtype_map[x.dtype]
+    weight_dtype = torch2cute_dtype_map[weight.dtype] if weight is not None else None
+    out_dtype = torch2cute_dtype_map[out.dtype]
+    
+    # Create compile key from shapes and dtypes (shapes don't matter, only dtypes)
+    compile_key = (dtype, weight_dtype, out_dtype, N)
+    
+    if compile_key not in _rmsnorm_fwd.compile_cache:
+        # Create fake tensors for compilation (shape-agnostic via batch_sym)
+        batch_sym = cute.symbolic.make_int_symbol()
+        all_dtypes = [dtype, out_dtype, weight_dtype]
+        div = math.gcd(N, *(128 // dt.width for dt in all_dtypes if dt is not None))
+        
+        x_cute = fake_tensor(dtype, (batch_sym, N), div)
+        out_cute = fake_tensor(out_dtype, (batch_sym, N), div)
+        weight_cute = fake_tensor(weight_dtype, (N,), div) if weight_dtype else None
+        rstd_cute = fake_tensor(Float32, (batch_sym,)) if rstd is not None else None
+        
+        # Compile kernel with TVM FFI for PyTorch stream integration
+        _rmsnorm_fwd.compile_cache[compile_key] = cute.compile(
+            RMSNorm(dtype, N),
+            x_cute,
+            weight_cute,
+            out_cute,
+            rstd_cute,
+            Float32(0),  # eps placeholder
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    
+    # Call compiled kernel
+    _rmsnorm_fwd.compile_cache[compile_key](x, weight, out, rstd, eps)
+
+_rmsnorm_fwd.compile_cache = {}
+
+
+def rmsnorm_fwd(
+    x: Tensor,
+    weight: Optional[Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    eps: float = 1e-6,
+    store_rstd: bool = False,
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """RMSNorm forward with automatic output allocation."""
+    out_dtype = x.dtype if out_dtype is None else out_dtype
+    out = torch.empty_like(x, dtype=out_dtype)
+    rstd = torch.empty(x.shape[0], device=x.device, dtype=torch.float32) if store_rstd else None
+    
+    _rmsnorm_fwd(x, weight, out, rstd, eps)
+    return out, rstd
+```
+
+### 5.2 Autograd Function with Compilation Caching
+
+```python
 from torch.autograd import Function
-from cutlass.cute.runtime import from_dlpack
 
-# Import DSL kernels
-from .cute_dsl import rmsnorm, sinkhorn, stream_ops
-
-class RMSNormDSL(Function):
+class RMSNormFunction(Function):
     @staticmethod
-    def forward(ctx, inp, weight, eps):
-        # Convert PyTorch tensors to CuTe tensors
-        inp_cute = from_dlpack(inp).mark_layout_dynamic()
-        weight_cute = from_dlpack(weight).mark_layout_dynamic()
-        
-        # Allocate outputs
-        out = torch.empty_like(inp)
-        rms = torch.empty(inp.size(0), dtype=torch.float32, device=inp.device)
-        
-        out_cute = from_dlpack(out).mark_layout_dynamic()
-        rms_cute = from_dlpack(rms).mark_layout_dynamic()
-        
-        # Launch kernel
-        B, C = inp.shape
-        rmsnorm.rmsnorm_forward(out_cute, rms_cute, inp_cute, weight_cute, 
-                                B, C, eps, output_rms=True)
-        
-        # Save for backward
-        ctx.save_for_backward(inp, weight, rms)
+    def forward(ctx, inp: Tensor, weight: Optional[Tensor], eps: float):
+        out, rstd = rmsnorm_fwd(inp, weight, eps=eps, store_rstd=True)
+        ctx.save_for_backward(inp, weight, rstd)
         ctx.eps = eps
         return out
     
     @staticmethod
-    def backward(ctx, grad_output):
-        inp, weight, rms = ctx.saved_tensors
+    def backward(ctx, grad_output: Tensor):
+        inp, weight, rstd = ctx.saved_tensors
         
-        # Convert tensors
-        grad_cute = from_dlpack(grad_output).mark_layout_dynamic()
-        inp_cute = from_dlpack(inp).mark_layout_dynamic()
-        weight_cute = from_dlpack(weight).mark_layout_dynamic()
-        rms_cute = from_dlpack(rms).mark_layout_dynamic()
+        d_inp = torch.empty_like(inp)
+        d_weight = torch.zeros_like(weight) if weight is not None else None
         
-        # Allocate gradient outputs
-        d_inp = torch.empty_like(inp, dtype=torch.float32)
-        d_weight = torch.zeros(weight.size(0), dtype=torch.float32, 
-                               device=weight.device)
+        _rmsnorm_bwd(grad_output, inp, weight, rstd, d_inp, d_weight)
         
-        d_inp_cute = from_dlpack(d_inp).mark_layout_dynamic()
-        d_weight_cute = from_dlpack(d_weight).mark_layout_dynamic()
-        
-        # Launch backward kernel
-        B, C = inp.shape
-        rmsnorm.rmsnorm_backward(d_inp_cute, d_weight_cute, grad_cute,
-                                 inp_cute, weight_cute, rms_cute, B, C)
-        
-        return d_inp.to(inp.dtype), d_weight, None
+        return d_inp, d_weight, None
 
-
-def rmsnorm_dsl(inp, weight, eps=1e-5):
-    """Functional interface for RMSNorm using CuTe DSL."""
-    return RMSNormDSL.apply(inp, weight, eps)
+def rmsnorm(inp: Tensor, weight: Optional[Tensor] = None, eps: float = 1e-6) -> Tensor:
+    """Functional interface for RMSNorm."""
+    return RMSNormFunction.apply(inp, weight, eps)
 ```
 
-### 5.2 Tensor Caching for Performance
+### 5.3 Fake Tensor Utilities for Compilation
 
 ```python
-class TensorCache:
-    """Cache CuTe tensor wrappers to avoid repeated from_dlpack calls."""
-    
-    def __init__(self):
-        self._cache = {}
-    
-    def get_or_create(self, tensor: torch.Tensor, key: str):
-        cache_key = (key, tensor.data_ptr(), tensor.shape, tensor.stride())
-        if cache_key not in self._cache:
-            self._cache[cache_key] = from_dlpack(tensor).mark_layout_dynamic()
-        return self._cache[cache_key]
-    
-    def clear(self):
-        self._cache.clear()
+"""Compilation utilities - adapted from Quack."""
 
-# Global cache instance
-_tensor_cache = TensorCache()
+import cutlass
+import cutlass.cute as cute
+
+def make_fake_tensor(dtype, shape, alignment_divisor=1):
+    """Create fake tensor for kernel compilation.
+    
+    Args:
+        dtype: CuTe dtype (Float32, BFloat16, etc.)
+        shape: Tensor shape (can include symbolic dimensions)
+        alignment_divisor: For vectorized loads, ensure shape is divisible by this
+    
+    Returns:
+        Fake CuTe tensor suitable for compilation
+    """
+    if dtype is None:
+        return None
+    
+    # Create layout
+    layout = cute.make_layout(shape)
+    
+    # Create fake pointer with proper alignment
+    fake_ptr = cute.make_ptr(dtype, 0, cute.AddressSpace.gmem)
+    
+    # Create tensor
+    tensor = cute.make_tensor(fake_ptr, layout)
+    
+    # Mark dimensions as dynamic for shape-agnostic compilation
+    tensor = tensor.mark_layout_dynamic()
+    
+    return tensor
+```
+
+### 5.4 Stream Integration
+
+```python
+"""Stream management for kernel launches."""
+
+import torch
+import cuda.bindings.driver as cuda
+
+def get_cuda_stream() -> cuda.CUstream:
+    """Get current CUDA stream from PyTorch."""
+    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+# In kernel class __call__ method:
+# stream = get_cuda_stream() if stream is None else stream
+# self.kernel(...).launch(..., stream=stream)
 ```
 
 ---
 
 ## 6. Migration Task List
 
+### Phase 0: Quack Integration Decision
+**Option A: Direct Dependency**
+- Add `quack-kernels` as a project dependency
+- Directly use Quack's RMSNorm forward/backward implementations
+- Focus MHC-specific kernels on Sinkhorn-Knopp and Stream operations
+
+**Option B: Adapt Patterns (Recommended)**
+- Copy and adapt key utility modules from Quack
+- Maintain full control over implementation
+- Customize for MHC-specific requirements
+
 ### Phase 1: Infrastructure (Week 1)
 - [ ] Set up `cute_dsl/` module structure
-- [ ] Implement `primitives.py` with fast_exp, fast_sigmoid, warp reductions
-- [ ] Implement `reductions.py` with block-level reductions
-- [ ] Implement `conversions.py` with bf16/f32 conversions
+- [ ] Copy and adapt `utils.py` from Quack (elem_pointer, store_shared_remote, f32x2 packing)
+- [ ] Copy and adapt `reduce.py` from Quack (block_reduce, cluster_reduce, row_reduce)
+- [ ] Copy and adapt `copy_utils.py` from Quack (tiled_copy_2d, predicate_k)
+- [ ] Copy and adapt `fast_math.py` from Quack (FastDivmod)
+- [ ] Implement `base.py` ReductionBase class
+- [ ] Create `cute_dsl_utils.py` with ParamsBase, ArgumentsBase, dtype mapping
 - [ ] Create test infrastructure with PyTorch reference implementations
+- [ ] Add `quack-kernels` as optional dependency for comparison benchmarks
 
 ### Phase 2: RMSNorm (Week 2)
-- [ ] Implement `rmsnorm_forward_kernel` (non-vectorized)
-- [ ] Implement `rmsnorm_forward_kernel_vectorized`
-- [ ] Implement `rmsnorm_backward_kernel`
-- [ ] Add PyTorch autograd wrapper
-- [ ] Validate against existing CUDA implementation
-- [ ] Benchmark and optimize
+- [ ] Implement `RMSNorm` class following Quack pattern
+  - [ ] Forward kernel with SmemAllocator
+  - [ ] Tiled copy with vectorized loads
+  - [ ] row_reduce with cluster support for large N (>16k)
+  - [ ] Reload strategy for very large N (>8k)
+- [ ] Implement `RMSNormBackward` class
+  - [ ] Persistent kernel pattern for backward
+  - [ ] Double-buffering for weight gradient accumulation
+- [ ] Add PyTorch autograd wrapper using `cute.compile` caching
+- [ ] Validate against existing CUDA implementation AND Quack
+- [ ] Benchmark vs Quack and original CUDA (target: match Quack performance)
 
 ### Phase 3: Sinkhorn-Knopp (Week 3)
+- [ ] Design Sinkhorn kernel class structure (no Quack equivalent)
 - [ ] Implement `sinkhorn_knopp_single_block_kernel` (M,N ≤ 64)
+  - [ ] Use SmemAllocator for tile storage
+  - [ ] Iterative row/column normalization with warp reductions
+  - [ ] Fast reciprocal via `cute.math.rsqrt` or PTX `frcp`
 - [ ] Implement `sinkhorn_knopp_warp_optimized_kernel` (32x32 special case)
+  - [ ] Leverage warp-level primitives for 32-wide rows/cols
 - [ ] Implement `sinkhorn_knopp_batched_kernel`
+  - [ ] Multi-block parallel batches
 - [ ] Implement `sinkhorn_knopp_backward_kernel`
+  - [ ] Forward checkpoint recomputation
 - [ ] Add fused exp variant
 - [ ] Validate and benchmark
 
 ### Phase 4: Stream Operations (Week 4)
-- [ ] Implement `stream_aggregate_kernel` (basic)
-- [ ] Implement `stream_aggregate_vectorized_kernel`
-- [ ] Implement `stream_distribute_mix_add_kernel`
+- [ ] Design Stream kernel class structure
+- [ ] Implement `StreamAggregate` class
+  - [ ] Fused sigmoid activation
+  - [ ] Vectorized bf16 accumulation
+  - [ ] Dynamic n variants
+- [ ] Implement `StreamDistributeMixAdd` class
+  - [ ] Fused activations on H_post
+  - [ ] Shared memory for weight broadcast
 - [ ] Implement backward kernels
-- [ ] Add dynamic H variants
+  - [ ] Multi-output gradient computation
 - [ ] Validate and benchmark
 
 ### Phase 5: Integration (Week 5)
 - [ ] Create unified `MHCLayerDSL` class
 - [ ] Integrate with cuBLAS for matmul operations
+  - [ ] Wrap in Python using PyTorch GEMM or direct cuBLAS bindings
 - [ ] Add stream/event management for pipelining
+- [ ] Implement `cute.compile` caching for all kernels
 - [ ] Full forward/backward validation
 - [ ] End-to-end benchmarks
 
 ### Phase 6: Optimization & Polish (Week 6)
-- [ ] Profile and identify bottlenecks
-- [ ] Tune block sizes and unroll factors
+- [ ] Profile with Nsight Compute
+- [ ] Compare against theoretical memory bandwidth limits
+- [ ] Tune:
+  - [ ] threads_per_row thresholds
+  - [ ] cluster_n thresholds
+  - [ ] vecsize selection
+  - [ ] reload_from strategy
 - [ ] Add PDL (Programmatic Dependent Launch) support where beneficial
 - [ ] Documentation and examples
 - [ ] Performance regression tests
+- [ ] Consider contributing improvements back to Quack
 
 ---
 
@@ -790,13 +1350,302 @@ def benchmark_rmsnorm(B, C, warmup=10, iters=100):
 
 ---
 
-## 10. References
+## 10. Quack Reference Implementation
+
+The [Quack library](https://github.com/Dao-AILab/quack) from Dao-AILab provides production-quality CuTe DSL kernels that achieve speed-of-light performance. We should leverage their patterns and utilities extensively.
+
+### 10.1 Key Utilities to Adopt from Quack
+
+#### Reduction Utilities (`quack/reduce.py`)
+
+```python
+# Block reduction with support for multiple warps per row
+@cute.jit
+def block_reduce(
+    val: cute.Numeric, 
+    op: Callable, 
+    reduction_buffer: cute.Tensor, 
+    init_val: cute.Numeric = 0.0
+) -> cute.Numeric:
+    """reduction_buffer has shape (num_warps / warp_per_row, warps_per_row)"""
+    lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
+    warps_per_row = cute.size(reduction_buffer.shape[1])
+    row_idx, col_idx = warp_idx // warps_per_row, warp_idx % warps_per_row
+    if lane_idx == 0:
+        reduction_buffer[row_idx, col_idx] = val
+    cute.arch.barrier()
+    block_reduce_val = init_val
+    if lane_idx < warps_per_row:
+        block_reduce_val = reduction_buffer[row_idx, lane_idx]
+    return cute.arch.warp_reduction(block_reduce_val, op)
+
+# Row reduction with optional cluster support (for N > 16k)
+@cute.jit
+def row_reduce(
+    x: cute.TensorSSA | cute.Numeric,
+    op: cute.ReductionOp,
+    threads_per_row: cutlass.Constexpr[int],
+    reduction_buffer: Optional[cute.Tensor] = None,
+    mbar_ptr: Optional[cute.Pointer] = None,  # For cluster reduction
+    phase: Optional[Int32] = None,
+    init_val: cute.Numeric = 0.0,
+    hook_fn: Optional[Callable] = None,
+) -> cute.Numeric:
+    """Unified row reduction supporting warp, block, and cluster levels."""
+    ...
+```
+
+#### Fast Math Utilities (`quack/fast_math.py`)
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class FastDivmod(ParamsBase):
+    """Fast integer division for index calculations."""
+    divisor: Int32
+    multiplier: Uint32
+    shift_right: Uint32
+
+    @staticmethod
+    def create(divisor: Int32) -> "FastDivmod":
+        """Precompute division parameters on host."""
+        p = Uint32(31 + find_log2(divisor))
+        divisor_u32 = Uint32(divisor)
+        multiplier = Uint32(((cutlass.Uint64(1) << p) + divisor_u32 - 1) // divisor_u32)
+        shift_right = Uint32(p - 32)
+        return FastDivmod(divisor, multiplier, shift_right)
+
+    @cute.jit
+    def div(self, dividend: Int32) -> Int32:
+        return Int32(umulhi(dividend, self.multiplier) >> self.shift_right) \
+               if self.divisor != 1 else dividend
+
+    def divmod(self, dividend: Int32) -> Tuple[Int32, Int32]:
+        quotient = self.div(dividend)
+        remainder = dividend - quotient * self.divisor
+        return quotient, remainder
+```
+
+#### Copy Utilities (`quack/copy_utils.py`)
+
+```python
+def tiled_copy_2d(
+    dtype: Type[cutlass.Numeric],
+    threads_per_row: int,
+    num_threads: int,
+    num_copy_elems: int = 1,
+    is_async: bool = False,
+) -> cute.TiledCopy:
+    """Create 2D tiled copy for row-major data with vectorized loads."""
+    num_copy_bits = num_copy_elems * dtype.width
+    copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
+    copy_atom = cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
+    thr_layout = cute.make_ordered_layout(
+        (num_threads // threads_per_row, threads_per_row),
+        order=(1, 0),
+    )
+    val_layout = cute.make_layout((1, num_copy_elems))
+    return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+
+@cute.jit
+def predicate_k(tAcA: cute.Tensor, limit: Int32) -> cute.Tensor:
+    """Compute predicates for K-dimension bounds checking."""
+    ...
+```
+
+#### General Utilities (`quack/utils.py`)
+
+```python
+@dsl_user_op
+def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+    """Get pointer to element at coordinate in tensor."""
+    return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
+
+@dsl_user_op
+def store_shared_remote(
+    val: float | Float32 | Int32,
+    smem_ptr: cute.Pointer,
+    mbar_ptr: cute.Pointer,
+    peer_cta_rank_in_cluster: cute.typing.Int,
+    *, loc=None, ip=None,
+) -> None:
+    """Store to another CTA's shared memory via distributed shared memory."""
+    ...
+
+@dsl_user_op
+def f32x2_to_i64(a: Float32, b: Float32, *, loc=None, ip=None) -> cutlass.Int64:
+    """Pack two f32 values into i64 for efficient reduction buffer transfers."""
+    ...
+
+@dsl_user_op  
+def i64_to_f32x2(c: cutlass.Int64, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+    """Unpack i64 back to two f32 values."""
+    ...
+
+@cute.jit
+def fill_oob(tXsX: cute.Tensor, tXpX: Optional[cute.Tensor], fill_value: cute.Numeric) -> None:
+    """Fill out-of-bounds values in shared memory tensor."""
+    ...
+```
+
+### 10.2 Quack Kernel Architecture Patterns
+
+#### ReductionBase Class Pattern
+
+```python
+class ReductionBase:
+    """Base class for reduction kernels (RMSNorm, Softmax, etc.)"""
+    
+    def __init__(self, dtype: Type[cutlass.Numeric], N: int, stage: int, reduction_dtype=Float32):
+        self.dtype = dtype
+        self.N = N
+        self.stage = stage  # For double-buffering
+        self.reduction_dtype = reduction_dtype
+
+    def _threads_per_row(self) -> int:
+        """Select threads per row based on reduction dimension."""
+        N = self.N
+        for limit, threads in [(64, 8), (128, 16), (3072, 32), (6144, 64), (16384, 128)]:
+            if N <= limit:
+                return threads
+        return 256
+
+    def _set_cluster_n(self):
+        """Set cluster size for distributed shared memory reduction."""
+        N = self.N
+        if const_expr(self.dtype.width == 16):
+            thresholds = [(16*1024, 1), (32*1024, 2), (64*1024, 4), (128*1024, 8)]
+        else:
+            thresholds = [(32*1024, 1), (64*1024, 2), (128*1024, 4), (256*1024, 8)]
+        for limit, cluster in thresholds:
+            if N <= limit:
+                self.cluster_n = cluster
+                return
+        self.cluster_n = 16
+
+    def _get_tiled_copy(self, vecsize: int = 1):
+        """Create tiled copy configuration."""
+        threads_per_row = self._threads_per_row()
+        num_threads = self._num_threads()
+        num_blocks_N = cute.ceil_div(self.N // vecsize, threads_per_row * self.cluster_n)
+        tiler_mn = (num_threads // threads_per_row, vecsize * num_blocks_N * threads_per_row)
+        tiled_copy = copy_utils.tiled_copy_2d(self.dtype, threads_per_row, num_threads, vecsize)
+        return tiled_copy, tiler_mn, threads_per_row
+
+    def _allocate_reduction_buffer_and_mbar(self, smem, tv_layout):
+        """Allocate reduction buffer and barrier for cluster reduction."""
+        ...
+```
+
+#### Kernel Launch Pattern with SmemAllocator
+
+```python
+@cute.kernel
+def kernel(
+    self,
+    mX: cute.Tensor,
+    mW: Optional[cute.Tensor],
+    mO: cute.Tensor,
+    eps: Float32,
+    tiler_mn: cute.Shape,
+    tiled_copy: cute.TiledCopy,
+    threads_per_row: cutlass.Constexpr[int],
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    
+    # Use SmemAllocator for organized shared memory management
+    smem = cutlass.utils.SmemAllocator()
+    sX = smem.allocate_tensor(
+        mX.element_type, 
+        cute.make_ordered_layout(tiler_mn, order=(1, 0)), 
+        byte_alignment=16
+    )
+    reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
+    
+    # Get thread-specific copy slice
+    thr_copy_X = tiled_copy.get_slice(tidx)
+    
+    # Partition tensors for this thread
+    tXgX = thr_copy_X.partition_S(gX)
+    tXsX = thr_copy_X.partition_D(sX)
+    
+    # Async copy from global to shared memory
+    copy(tXgX, tXsX, is_async=True)
+    cute.arch.cp_async_commit_group()
+    cute.arch.cp_async_wait_group(0)
+    
+    # Load from shared to registers
+    cute.autovec_copy(tXsX, tXrX)
+    x = tXrX.load().to(cute.Float32)
+    
+    # Perform reduction
+    sum_sq_x = row_reduce(
+        x * x,
+        cute.ReductionOp.ADD,
+        threads_per_row,
+        reduction_buffer[None, None, 0],
+        mbar_ptr,
+        init_val=0.0,
+    )
+    ...
+```
+
+### 10.3 Key Paradigms to Adopt
+
+| Pattern | Description | Where to Apply |
+|---------|-------------|----------------|
+| **SmemAllocator** | Structured shared memory allocation with alignment | All kernels using smem |
+| **TiledCopy** | Vectorized loads with thread-value layouts | RMSNorm, Stream Ops |
+| **ReductionBase** | Base class with common reduction infrastructure | All reduction kernels |
+| **Cluster Reduction** | Distributed smem for large reductions (N > 16k) | RMSNorm with large C |
+| **FastDivmod** | Fast integer division for index calculations | Batched kernels |
+| **Predicate Tensors** | Efficient bounds checking for uneven dimensions | All kernels |
+| **f32x2 Packing** | Pack two f32 values for efficient smem transfers | Online softmax pattern |
+| **Async Copy Pipeline** | `cp_async_commit_group` / `wait_group` patterns | Memory-bound kernels |
+
+### 10.4 Memory Hierarchy Strategy (from Quack Blogpost)
+
+For memory-bound kernels, follow the reduction strategy:
+
+| Execution Granularity | Operating Memory | Reduction Strategy |
+|----------------------|------------------|-------------------|
+| Threads | Registers | `TensorSSA.reduce()` |
+| Warps | Registers | `cute.arch.warp_reduction()` |
+| Thread Blocks | Shared Memory | `block_reduce()` with smem buffer |
+| Thread Block Clusters | Distributed Shared Memory | `cluster_reduce()` with mbarrier |
+
+**Key insight**: Maximize local reduction at higher memory levels, only forward small intermediate results to next level.
+
+### 10.5 Updated Code Organization
+
+```
+src/python/mhc/
+├── cute_dsl/
+│   ├── __init__.py
+│   ├── base.py                 # ReductionBase class (from Quack pattern)
+│   ├── reduce.py               # block_reduce, row_reduce, cluster_reduce
+│   ├── copy_utils.py           # tiled_copy_1d/2d, predicate_k, async copy
+│   ├── utils.py                # elem_pointer, store_shared_remote, f32x2 pack
+│   ├── fast_math.py            # FastDivmod, clz, umulhi
+│   ├── rmsnorm.py              # RMSNorm kernel class
+│   ├── sinkhorn.py             # Sinkhorn-Knopp kernels  
+│   ├── stream_ops.py           # Stream aggregation/distribution
+│   └── mhc_layer.py            # Complete MHC layer
+```
+
+---
+
+## 11. References
 
 1. [CUTLASS Python DSL Documentation](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl.html)
 2. [CuTe DSL Introduction](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html)
 3. [CuTe DSL Control Flow](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_control_flow.html)
 4. [Framework Integration Guide](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/framework_integration.html)
-5. Original MHC CUDA implementation in this repository
+5. **[Quack: A Quirky Assortment of CuTe Kernels](https://github.com/Dao-AILab/quack)** - Reference implementation
+6. **[Getting Memory-bound Kernels to Speed-of-Light](https://github.com/Dao-AILab/quack/blob/main/media/2025-07-10-membound-sol.md)** - Quack blogpost on memory hierarchy
+7. Original MHC CUDA implementation in this repository
 
 ---
 
