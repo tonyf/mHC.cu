@@ -64,13 +64,13 @@ class MHCLayerFunction(Function):
         # Step 2: RMSNorm on aggregated features
         # y_norm = rmsnorm(x_agg)
         y_norm, rms = rmsnorm_fwd(
-            x_agg.unsqueeze(1),  # [B, 1, C]
+            x_agg,  # [B, C]
             rmsnorm_weight,
             out_dtype=torch.bfloat16,
             eps=eps,
             store_rstd=True,
         )
-        y_norm = y_norm.squeeze(1)  # [B, C]
+        # y_norm shape: [B, C]
 
         # Step 3: Sinkhorn-Knopp on residual weights
         # M = sinkhorn(exp(H_res))

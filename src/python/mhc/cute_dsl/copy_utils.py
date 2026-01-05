@@ -7,7 +7,11 @@ Adapted from Quack's copy_utils.py for MHC kernels. Provides:
 - Register load utilities
 """
 
-from typing import Optional, Type
+from __future__ import annotations
+from typing import Optional, Type, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from cutlass import Int32, Boolean
 
 try:
     import cutlass
@@ -18,6 +22,8 @@ try:
     CUTLASS_AVAILABLE = True
 except ImportError:
     CUTLASS_AVAILABLE = False
+    Int32 = None
+    Boolean = None
 
 
 def load_s2r(src, *, loc=None, ip=None):
@@ -111,7 +117,7 @@ def tiled_copy_2d(
     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
 
-def predicate_k(tAcA, limit: Int32):
+def predicate_k(tAcA, limit):
     """Compute predicates for K-dimension bounds checking.
 
     Used for handling non-divisible dimensions where some threads

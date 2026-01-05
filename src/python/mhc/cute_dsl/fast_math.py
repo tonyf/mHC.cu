@@ -6,6 +6,7 @@ Adapted from Quack's fast_math.py for MHC kernels. Provides:
 - Fast math operations using PTX intrinsics
 """
 
+from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -19,6 +20,10 @@ try:
     CUTLASS_AVAILABLE = True
 except ImportError:
     CUTLASS_AVAILABLE = False
+    Int32 = None
+    Uint32 = None
+    Int64 = None
+    Float32 = None
 
     def dsl_user_op(fn):
         return fn
@@ -27,7 +32,7 @@ except ImportError:
 from .cute_dsl_utils import ParamsBase
 
 
-def clz(x: Int32) -> Int32:
+def clz(x):
     """Count leading zeros in 32-bit integer.
 
     Args:
@@ -52,7 +57,7 @@ def clz(x: Int32) -> Int32:
     return _clz_impl(x)
 
 
-def find_log2(x: Int32) -> Int32:
+def find_log2(x):
     """Find log2 rounded up.
 
     Args:
@@ -73,7 +78,7 @@ def find_log2(x: Int32) -> Int32:
 
 
 @dsl_user_op
-def umulhi(a: Int32, b: Int32, *, loc=None, ip=None) -> Uint32:
+def umulhi(a, b, *, loc=None, ip=None):
     """Unsigned multiply high - returns high 32 bits of 64-bit product.
 
     This is a PTX instruction for fast division.
@@ -114,9 +119,9 @@ class FastDivmod(ParamsBase):
         quotient, remainder = divmod_helper.divmod(dividend)
     """
 
-    divisor: Int32
-    multiplier: Uint32
-    shift_right: Uint32
+    divisor: int
+    multiplier: int
+    shift_right: int
 
     @staticmethod
     def create(divisor: int) -> "FastDivmod":
@@ -133,9 +138,9 @@ class FastDivmod(ParamsBase):
 
         if divisor == 1:
             return FastDivmod(
-                divisor=Int32(1) if CUTLASS_AVAILABLE else 1,
-                multiplier=Uint32(1) if CUTLASS_AVAILABLE else 1,
-                shift_right=Uint32(0) if CUTLASS_AVAILABLE else 0,
+                divisor=1,
+                multiplier=1,
+                shift_right=0,
             )
 
         # Find log2(divisor) rounded up
@@ -146,20 +151,13 @@ class FastDivmod(ParamsBase):
         multiplier = ((1 << p) + divisor - 1) // divisor
         shift_right = p - 32
 
-        if CUTLASS_AVAILABLE:
-            return FastDivmod(
-                divisor=Int32(divisor),
-                multiplier=Uint32(multiplier),
-                shift_right=Uint32(shift_right),
-            )
-        else:
-            return FastDivmod(
-                divisor=divisor,
-                multiplier=multiplier,
-                shift_right=shift_right,
-            )
+        return FastDivmod(
+            divisor=divisor,
+            multiplier=multiplier,
+            shift_right=shift_right,
+        )
 
-    def div(self, dividend: Int32) -> Int32:
+    def div(self, dividend):
         """Fast division on device.
 
         Args:
@@ -182,7 +180,7 @@ class FastDivmod(ParamsBase):
             self.divisor, self.multiplier, self.shift_right, dividend
         )
 
-    def divmod(self, dividend: Int32) -> Tuple[Int32, Int32]:
+    def divmod(self, dividend):
         """Fast divmod on device.
 
         Args:
@@ -313,7 +311,7 @@ def fast_sqrtf(x, *, loc=None, ip=None):
     )
 
 
-def fast_sigmoid(x: Float32) -> Float32:
+def fast_sigmoid(x):
     """Fast sigmoid function.
 
     sigmoid(x) = 1 / (1 + exp(-x))
@@ -335,7 +333,7 @@ def fast_sigmoid(x: Float32) -> Float32:
     return _fast_sigmoid_impl(x)
 
 
-def fast_gelu(x: Float32) -> Float32:
+def fast_gelu(x):
     """Fast GELU activation.
 
     GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))

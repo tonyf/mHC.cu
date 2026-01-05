@@ -3,16 +3,24 @@ from torch.autograd import Function
 
 try:
     import mhc_cuda
+    MHC_CUDA_AVAILABLE = True
 except ImportError:
-    raise ImportError(
-        "mhc_cuda not found. Please install the CUDA extension by running:\n"
-        "pip install -e ."
-    )
+    mhc_cuda = None
+    MHC_CUDA_AVAILABLE = False
+
+
+def _check_cuda_available():
+    if not MHC_CUDA_AVAILABLE:
+        raise ImportError(
+            "mhc_cuda not found. Please install the CUDA extension by running:\n"
+            "pip install -e ."
+        )
 
 
 class SinkhornKnoppFunction(Function):
     @staticmethod
     def forward(ctx, inp, num_iters, eps):
+        _check_cuda_available()
         out = mhc_cuda.sinkhorn_knopp_fwd(inp.contiguous(), num_iters, eps)
         ctx.save_for_backward(out, inp)
         ctx.num_iters = num_iters
@@ -21,6 +29,7 @@ class SinkhornKnoppFunction(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        _check_cuda_available()
         out, inp = ctx.saved_tensors
         d_inp = mhc_cuda.sinkhorn_knopp_bwd(
             grad_output.contiguous(), out, inp, ctx.num_iters, ctx.eps
@@ -31,12 +40,14 @@ class SinkhornKnoppFunction(Function):
 class RMSNormFunction(Function):
     @staticmethod
     def forward(ctx, inp, weight, eps):
+        _check_cuda_available()
         out, rms = mhc_cuda.rmsnorm_fwd(inp.contiguous(), weight.contiguous(), eps)
         ctx.save_for_backward(inp, weight, rms)
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
+        _check_cuda_available()
         inp, weight, rms = ctx.saved_tensors
         d_inp, d_weight = mhc_cuda.rmsnorm_bwd(
             grad_output.contiguous(), inp, weight, rms
@@ -57,6 +68,7 @@ class MHCLayerFunction(Function):
     def forward(
         ctx, x_expanded, rmsnorm_weight, H_pre, H_post, H_res, sinkhorn_iters, eps
     ):
+        _check_cuda_available()
         (
             output,
             rms,
@@ -92,6 +104,7 @@ class MHCLayerFunction(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        _check_cuda_available()
         (
             x_expanded,
             rmsnorm_weight,
@@ -140,6 +153,7 @@ def mhc_layer_fused_inference(
     x_expanded, rmsnorm_weight, H_pre, H_post, H_res, sinkhorn_iters=20, eps=1e-5
 ):
     # inference focused forward pass -> no backward support for maximum speed
+    _check_cuda_available()
     return mhc_cuda.mhc_layer_fwd_inference(
         x_expanded.float().contiguous(),
         rmsnorm_weight.bfloat16().contiguous(),
@@ -169,6 +183,7 @@ class MHCLayerDynamicFunction(Function):
         sinkhorn_iters,
         eps,
     ):
+        _check_cuda_available()
         n = phi_pre.size(0)
         phi_concat = (
             torch.cat([phi_pre, phi_post, phi_res.view(n * n, -1)], dim=0)
@@ -215,6 +230,7 @@ class MHCLayerDynamicFunction(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        _check_cuda_available()
         (
             x_expanded,
             rmsnorm_weight,

@@ -7,6 +7,7 @@ Adapted from Quack's utils.py for MHC kernels. Provides:
 - Out-of-bounds filling utilities
 """
 
+from __future__ import annotations
 from functools import partial
 from typing import Optional, Tuple
 
@@ -20,6 +21,9 @@ try:
     CUTLASS_AVAILABLE = True
 except ImportError:
     CUTLASS_AVAILABLE = False
+    Float32 = None
+    Int32 = None
+    Int64 = None
 
     # Provide stub decorators for when CUTLASS is not available
     def dsl_user_op(fn):
@@ -56,7 +60,7 @@ def elem_pointer(x, coord, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def set_block_rank(smem_ptr, peer_cta_rank_in_cluster: Int32, *, loc=None, ip=None):
+def set_block_rank(smem_ptr, peer_cta_rank_in_cluster, *, loc=None, ip=None):
     """Map smem pointer to address at another CTA rank in cluster.
 
     Used for distributed shared memory operations.
@@ -229,7 +233,7 @@ def atomic_add_f32(a, gmem_ptr, *, loc=None, ip=None):
     )
 
 
-def fill_oob(tXsX, tXpX: Optional, fill_value) -> None:
+def fill_oob(tXsX, tXpX, fill_value) -> None:
     """Fill out-of-bounds values in shared memory tensor.
 
     Args:
@@ -255,7 +259,7 @@ def fill_oob(tXsX, tXpX: Optional, fill_value) -> None:
     _fill_oob_impl(tXsX, tXpX, fill_value)
 
 
-def fast_exp(x: Float32) -> Float32:
+def fast_exp(x):
     """Fast exponential using PTX intrinsic.
 
     Args:
@@ -271,7 +275,7 @@ def fast_exp(x: Float32) -> Float32:
     return cute.math.exp(x, fastmath=True)
 
 
-def fast_sigmoid(x: Float32) -> Float32:
+def fast_sigmoid(x):
     """Fast sigmoid using fast reciprocal.
 
     sigmoid(x) = 1 / (1 + exp(-x))
@@ -291,7 +295,7 @@ def fast_sigmoid(x: Float32) -> Float32:
     ) * (Float32(1.0) + exp_neg_x)
 
 
-def fast_rsqrt(x: Float32) -> Float32:
+def fast_rsqrt(x):
     """Fast reciprocal square root.
 
     Args:
@@ -306,7 +310,7 @@ def fast_rsqrt(x: Float32) -> Float32:
     return cute.math.rsqrt(x, fastmath=True)
 
 
-def fast_rcp(x: Float32) -> Float32:
+def fast_rcp(x):
     """Fast reciprocal.
 
     Args:

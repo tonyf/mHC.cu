@@ -379,8 +379,24 @@ def _rmsnorm_fwd_impl(
     eps: float,
 ):
     """Internal forward implementation with compilation caching."""
-    if not CUTLASS_AVAILABLE:
-        raise RuntimeError("CUTLASS not available. Install nvidia-cutlass package.")
+    if not CUTLASS_AVAILABLE or not x.is_cuda:
+        # Use PyTorch fallback
+        x_f32 = x.float()
+        rms = torch.sqrt(x_f32.square().mean(dim=-1, keepdim=True) + eps)
+        x_norm = x_f32 / rms
+        if weight is not None:
+            result = x_norm * weight.float()
+        else:
+            result = x_norm
+        out.copy_(result.to(out.dtype))
+        if rstd is not None:
+            # Handle various input shapes
+            rstd_val = (1.0 / rms).view(-1)
+            if rstd_val.shape[0] == rstd.shape[0]:
+                rstd.copy_(rstd_val)
+            else:
+                rstd.copy_(rstd_val[:rstd.shape[0]])
+        return
 
     B, N = x.shape
     dtype = get_cute_dtype(x.dtype)

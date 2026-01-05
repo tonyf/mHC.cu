@@ -1,10 +1,11 @@
-from .layer import MHCLayer
 from .ops import (
     sinkhorn_knopp,
     rmsnorm,
     mhc_layer_fused,
     mhc_layer_fused_dynamic,
+    MHC_CUDA_AVAILABLE,
 )
+from .layer import MHCLayer
 
 # CuTe DSL implementations (optional - requires nvidia-cutlass)
 try:
@@ -33,6 +34,7 @@ __all__ = [
     "rmsnorm",
     "mhc_layer_fused",
     "mhc_layer_fused_dynamic",
+    "MHC_CUDA_AVAILABLE",
     # CuTe DSL implementations
     "MHCLayerDSL",
     "mhc_layer_fused_dsl",

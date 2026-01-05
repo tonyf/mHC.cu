@@ -7,6 +7,7 @@ Adapted from Quack's reduce.py for MHC kernels. Provides:
 - Unified row_reduce function supporting all levels
 """
 
+from __future__ import annotations
 import operator
 from typing import Callable, Optional
 
@@ -18,6 +19,8 @@ try:
     CUTLASS_AVAILABLE = True
 except ImportError:
     CUTLASS_AVAILABLE = False
+    Int32 = None
+    Float32 = None
 
 from .utils import elem_pointer, store_shared_remote
 
@@ -25,7 +28,7 @@ from .utils import elem_pointer, store_shared_remote
 WARP_SIZE = 32
 
 
-def warp_reduce_sum(val: Float32) -> Float32:
+def warp_reduce_sum(val):
     """Butterfly reduction within a warp for sum.
 
     Args:
@@ -47,7 +50,7 @@ def warp_reduce_sum(val: Float32) -> Float32:
     return _warp_reduce_sum_impl(val)
 
 
-def warp_reduce_max(val: Float32) -> Float32:
+def warp_reduce_max(val):
     """Butterfly reduction within a warp for max.
 
     Args:
@@ -116,7 +119,7 @@ def cluster_reduce(
     reduction_buffer,
     mbar_ptr,
     init_val=0.0,
-    phase: Optional[Int32] = None,
+    phase=None,
 ):
     """Cluster reduction via distributed shared memory.
 
@@ -183,9 +186,9 @@ def row_reduce(
     threads_per_row,
     reduction_buffer=None,
     mbar_ptr=None,
-    phase: Optional[Int32] = None,
+    phase=None,
     init_val=0.0,
-    hook_fn: Optional[Callable] = None,
+    hook_fn=None,
 ):
     """Unified row reduction supporting warp, block, and cluster levels.
 
@@ -283,7 +286,7 @@ def sum_reduce(x, threads_per_row, reduction_buffer=None, mbar_ptr=None):
         threads_per_row,
         reduction_buffer=reduction_buffer,
         mbar_ptr=mbar_ptr,
-        init_val=Float32(0.0),
+        init_val=0.0,
     )
 
 
@@ -308,5 +311,5 @@ def max_reduce(x, threads_per_row, reduction_buffer=None, mbar_ptr=None):
         threads_per_row,
         reduction_buffer=reduction_buffer,
         mbar_ptr=mbar_ptr,
-        init_val=Float32(float("-inf")),
+        init_val=float("-inf"),
     )
