@@ -1206,84 +1206,743 @@ def get_cuda_stream() -> cuda.CUstream:
 
 ---
 
-## 7. Testing Strategy
+## 7. Testing Strategy with pytest
 
-### 7.1 Unit Tests
+### 7.1 Design Principles for Testing
 
-```python
-# tests/test_cute_dsl/test_rmsnorm.py
+#### Correctness Testing Principles
 
-import torch
-import pytest
-from mhc.cute_dsl import rmsnorm
+1. **Reference Implementation Comparison**: Every kernel must have a PyTorch reference implementation for ground truth
+2. **Tolerance-Based Assertions**: Use dtype-appropriate tolerances (bf16: `atol=1e-1`, fp16: `atol=1e-2`, fp32: `atol=1e-4`)
+3. **Parametric Coverage**: Test across multiple dimensions, batch sizes, and dtypes using `@pytest.mark.parametrize`
+4. **Boundary Conditions**: Test edge cases (N=1, non-power-of-2 dimensions, uneven shapes)
+5. **Numerical Stability**: Test with extreme values (large, small, mixed) to verify stability
+6. **Gradient Verification**: Use `torch.autograd.gradcheck` for backward pass validation
+7. **Property Testing**: Verify mathematical properties (e.g., doubly stochastic for Sinkhorn)
 
-class TestRMSNormDSL:
-    @pytest.mark.parametrize("B,C", [(1, 64), (32, 256), (128, 1024)])
-    def test_forward_matches_reference(self, B, C):
-        inp = torch.randn(B, C, device='cuda', dtype=torch.bfloat16)
-        weight = torch.randn(C, device='cuda', dtype=torch.bfloat16)
-        eps = 1e-5
-        
-        # Reference implementation
-        rms = torch.sqrt(inp.float().pow(2).mean(-1, keepdim=True) + eps)
-        ref_out = (inp.float() / rms * weight.float()).bfloat16()
-        
-        # DSL implementation
-        dsl_out = rmsnorm.rmsnorm_forward_dsl(inp, weight, eps)
-        
-        torch.testing.assert_close(dsl_out, ref_out, rtol=1e-2, atol=1e-3)
-    
-    def test_backward_gradients(self):
-        B, C = 32, 256
-        inp = torch.randn(B, C, device='cuda', dtype=torch.float32, 
-                          requires_grad=True)
-        weight = torch.randn(C, device='cuda', dtype=torch.float32,
-                             requires_grad=True)
-        
-        # Use gradcheck
-        torch.autograd.gradcheck(
-            lambda x, w: rmsnorm.rmsnorm_dsl(x, w, eps=1e-5),
-            (inp, weight),
-            eps=1e-4
-        )
+#### Performance Testing Principles
+
+1. **Warmup Runs**: Always execute warmup iterations before timing
+2. **Multiple Iterations**: Average over many runs to reduce noise
+3. **CUDA Synchronization**: Call `torch.cuda.synchronize()` before/after timing
+4. **Baseline Comparison**: Compare against both original CUDA and Quack implementations
+5. **Memory Bandwidth Analysis**: Calculate achieved bandwidth vs theoretical peak
+6. **Regression Detection**: Track performance over time, fail CI on significant regression
+
+### 7.2 Test File Organization
+
+```
+tests/
+├── conftest.py                      # Shared fixtures and utilities
+├── test_cute_dsl/
+│   ├── __init__.py
+│   ├── test_utils.py                # Test utility modules
+│   ├── test_reduce.py               # Test reduction primitives
+│   ├── test_copy_utils.py           # Test copy utilities
+│   ├── test_rmsnorm.py              # RMSNorm forward/backward tests
+│   ├── test_sinkhorn.py             # Sinkhorn-Knopp tests
+│   ├── test_stream_ops.py           # Stream operations tests
+│   ├── test_mhc_layer.py            # Full layer integration tests
+│   └── test_compile_cache.py        # JIT compilation caching tests
+├── benchmarks/
+│   ├── __init__.py
+│   ├── bench_rmsnorm.py
+│   ├── bench_sinkhorn.py
+│   ├── bench_stream_ops.py
+│   └── bench_mhc_layer.py
 ```
 
-### 7.2 Benchmark Suite
+### 7.3 Shared Test Fixtures (`conftest.py`)
 
 ```python
-# benchmarks/bench_cute_dsl.py
+"""Shared pytest fixtures for CuTe DSL tests."""
 
+import pytest
+import torch
+
+# Increase torch.compile cache for parametric tests
+torch._dynamo.config.cache_size_limit = 1024
+torch._dynamo.config.accumulated_cache_size_limit = 1024
+
+
+@pytest.fixture(scope="session")
+def device():
+    """CUDA device fixture."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    return torch.device("cuda")
+
+
+@pytest.fixture
+def seed():
+    """Set random seed for reproducibility."""
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    return 42
+
+
+def get_tolerance(dtype: torch.dtype) -> tuple[float, float]:
+    """Get appropriate tolerance for dtype."""
+    if dtype == torch.bfloat16:
+        return 1e-1, 1e-2  # atol, rtol
+    elif dtype == torch.float16:
+        return 1e-2, 1e-3
+    elif dtype == torch.float32:
+        return 1e-4, 1e-4
+    else:
+        raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def rmsnorm_ref(x, weight=None, bias=None, residual=None, eps=1e-6):
+    """Reference implementation for RMSNorm."""
+    x_f32 = x.float()
+    if residual is not None:
+        x_f32 = x_f32 + residual.float()
+    rms = torch.sqrt(x_f32.square().mean(dim=-1, keepdim=True) + eps)
+    x_norm = x_f32 / rms
+    out = x_norm * weight.float() if weight is not None else x_norm
+    if bias is not None:
+        out = out + bias.float()
+    if residual is None:
+        return out.to(x.dtype)
+    else:
+        return out.to(x.dtype), x_f32.to(residual.dtype)
+
+
+def sinkhorn_ref(M, num_iters=10, eps=1e-8):
+    """Reference implementation for Sinkhorn-Knopp."""
+    M = M.float()
+    for _ in range(num_iters):
+        M = M / (M.sum(dim=1, keepdim=True) + eps)
+        M = M / (M.sum(dim=0, keepdim=True) + eps)
+    return M
+```
+
+### 7.4 RMSNorm Test Suite (`test_rmsnorm.py`)
+
+```python
+"""RMSNorm kernel tests - following Quack testing patterns."""
+
+import pytest
+import torch
+
+from mhc.cute_dsl.rmsnorm import rmsnorm, rmsnorm_fwd, _rmsnorm_fwd
+from tests.conftest import get_tolerance, rmsnorm_ref
+
+
+class TestRMSNormForward:
+    """Forward pass correctness tests."""
+    
+    @pytest.mark.parametrize("eps", [1e-5, 1e-6])
+    @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float16, torch.float32, None])
+    @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16, torch.float32])
+    @pytest.mark.parametrize("N", [
+        64, 128, 256, 512, 1024, 2048, 4096,  # Small to medium
+        8192, 16384,                           # Large (single block)
+        32768, 65536, 131072,                  # Very large (cluster reduction)
+    ])
+    @pytest.mark.parametrize("M", [1, 37, 199, 1024])  # Include non-power-of-2
+    @pytest.mark.parametrize("use_compile", [False, True])
+    def test_forward_correctness(self, M, N, input_dtype, weight_dtype, eps, use_compile, device, seed):
+        """Test forward pass matches reference implementation."""
+        # Skip OOM-prone combinations
+        if N >= 128 * 1024 and input_dtype == torch.float32 and M >= 1024:
+            pytest.skip("Skipping large float32 test to avoid OOM")
+        
+        atol, rtol = get_tolerance(input_dtype)
+        
+        x = torch.randn(M, N, device=device, dtype=input_dtype, requires_grad=True)
+        weight = torch.randn(N, device=device, dtype=weight_dtype) if weight_dtype else None
+        
+        x_ref = x.detach().clone().requires_grad_()
+        weight_ref = weight.detach().clone() if weight is not None else None
+        
+        fn = torch.compile(rmsnorm, fullgraph=True) if use_compile else rmsnorm
+        out = fn(x, weight, eps=eps)
+        out_ref = rmsnorm_ref(x_ref, weight_ref, eps=eps)
+        
+        assert out.shape == x.shape
+        assert out.dtype == input_dtype
+        torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
+
+    @pytest.mark.parametrize("N", [192, 760, 1128, 3000])  # Non-power-of-2 dimensions
+    def test_uneven_dimensions(self, N, device, seed):
+        """Test with non-power-of-2 dimensions."""
+        M = 32
+        x = torch.randn(M, N, device=device, dtype=torch.bfloat16)
+        weight = torch.randn(N, device=device, dtype=torch.float32)
+        
+        out = rmsnorm(x, weight)
+        out_ref = rmsnorm_ref(x, weight)
+        
+        torch.testing.assert_close(out, out_ref, atol=1e-1, rtol=1e-2)
+
+
+class TestRMSNormBackward:
+    """Backward pass correctness tests."""
+    
+    @pytest.mark.parametrize("N", [256, 1024, 4096, 16384])
+    @pytest.mark.parametrize("M", [1, 32, 128])
+    def test_backward_correctness(self, M, N, device, seed):
+        """Test backward pass matches reference implementation."""
+        x = torch.randn(M, N, device=device, dtype=torch.bfloat16, requires_grad=True)
+        weight = torch.randn(N, device=device, dtype=torch.float32, requires_grad=True)
+        
+        x_ref = x.detach().clone().requires_grad_()
+        weight_ref = weight.detach().clone().requires_grad_()
+        
+        out = rmsnorm(x, weight)
+        out_ref = rmsnorm_ref(x_ref, weight_ref)
+        
+        grad_out = torch.randn_like(out)
+        torch.cuda.synchronize()
+        
+        out.backward(grad_out)
+        out_ref.backward(grad_out)
+        
+        atol, rtol = get_tolerance(x.dtype)
+        torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=rtol)
+        torch.testing.assert_close(weight.grad, weight_ref.grad, atol=1e-2, rtol=1e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float32])  # gradcheck requires float32
+    def test_gradcheck(self, dtype, device, seed):
+        """Test gradients with torch.autograd.gradcheck."""
+        M, N = 8, 64  # Small for gradcheck
+        x = torch.randn(M, N, device=device, dtype=dtype, requires_grad=True)
+        weight = torch.randn(N, device=device, dtype=dtype, requires_grad=True)
+        
+        def fn(x, w):
+            return rmsnorm(x, w, eps=1e-5)
+        
+        torch.autograd.gradcheck(fn, (x, weight), eps=1e-4, atol=1e-3, rtol=1e-3)
+
+
+class TestRMSNormNumericalStability:
+    """Numerical stability tests."""
+    
+    def test_large_values(self, device, seed):
+        """Test with large input values."""
+        M, N = 32, 1024
+        x = torch.randn(M, N, device=device, dtype=torch.bfloat16) * 1000
+        weight = torch.randn(N, device=device, dtype=torch.float32)
+        
+        out = rmsnorm(x, weight)
+        
+        assert not torch.isnan(out).any(), "NaN in output"
+        assert not torch.isinf(out).any(), "Inf in output"
+
+    def test_small_values(self, device, seed):
+        """Test with small input values."""
+        M, N = 32, 1024
+        x = torch.randn(M, N, device=device, dtype=torch.bfloat16) * 1e-6
+        weight = torch.randn(N, device=device, dtype=torch.float32)
+        
+        out = rmsnorm(x, weight)
+        
+        assert not torch.isnan(out).any(), "NaN in output"
+        assert not torch.isinf(out).any(), "Inf in output"
+
+    def test_mixed_extreme_values(self, device, seed):
+        """Test with mixed large and small values."""
+        M, N = 32, 1024
+        x = torch.randn(M, N, device=device, dtype=torch.bfloat16)
+        x[:, :N//2] *= 1000
+        x[:, N//2:] *= 1e-6
+        weight = torch.randn(N, device=device, dtype=torch.float32)
+        
+        out = rmsnorm(x, weight)
+        
+        assert not torch.isnan(out).any(), "NaN in output"
+        assert not torch.isinf(out).any(), "Inf in output"
+
+
+class TestRMSNormCompileCache:
+    """JIT compilation cache tests."""
+    
+    def test_cache_reuse_same_dtype(self, device, seed):
+        """Test cache reuse for same dtype, different batch size."""
+        _rmsnorm_fwd.compile_cache.clear()
+        
+        N = 1024
+        weight = torch.randn(N, device=device, dtype=torch.float32)
+        
+        # First call
+        x1 = torch.randn(32, N, device=device, dtype=torch.bfloat16)
+        rmsnorm_fwd(x1, weight)
+        cache_size_1 = len(_rmsnorm_fwd.compile_cache)
+        
+        # Different batch size - should reuse cache
+        x2 = torch.randn(64, N, device=device, dtype=torch.bfloat16)
+        rmsnorm_fwd(x2, weight)
+        cache_size_2 = len(_rmsnorm_fwd.compile_cache)
+        
+        assert cache_size_1 == cache_size_2, "Cache should be reused for different batch sizes"
+
+    def test_cache_miss_different_n(self, device, seed):
+        """Test cache miss for different N dimension."""
+        _rmsnorm_fwd.compile_cache.clear()
+        
+        M = 32
+        
+        # First N
+        x1 = torch.randn(M, 1024, device=device, dtype=torch.bfloat16)
+        w1 = torch.randn(1024, device=device, dtype=torch.float32)
+        rmsnorm_fwd(x1, w1)
+        cache_size_1 = len(_rmsnorm_fwd.compile_cache)
+        
+        # Different N - should create new cache entry
+        x2 = torch.randn(M, 2048, device=device, dtype=torch.bfloat16)
+        w2 = torch.randn(2048, device=device, dtype=torch.float32)
+        rmsnorm_fwd(x2, w2)
+        cache_size_2 = len(_rmsnorm_fwd.compile_cache)
+        
+        assert cache_size_2 == cache_size_1 + 1, "Different N should create new cache entry"
+
+
+class TestRMSNormInputValidation:
+    """Input validation tests."""
+    
+    def test_weight_dimension_mismatch(self, device):
+        """Test error on weight dimension mismatch."""
+        x = torch.randn(32, 1024, device=device, dtype=torch.bfloat16)
+        weight = torch.randn(512, device=device, dtype=torch.float32)  # Wrong size
+        
+        with pytest.raises((ValueError, RuntimeError)):
+            rmsnorm(x, weight)
+
+    def test_cpu_tensor_rejected(self, device):
+        """Test that CPU tensors are rejected."""
+        x = torch.randn(32, 1024, dtype=torch.bfloat16)  # CPU
+        weight = torch.randn(1024, dtype=torch.float32)
+        
+        with pytest.raises((AssertionError, NotImplementedError, RuntimeError)):
+            rmsnorm(x, weight)
+
+    def test_unsupported_dtype(self, device):
+        """Test that unsupported dtypes are rejected."""
+        x = torch.randn(32, 1024, device=device, dtype=torch.float64)
+        weight = torch.randn(1024, device=device, dtype=torch.float32)
+        
+        with pytest.raises((AssertionError, ValueError, KeyError)):
+            rmsnorm(x, weight)
+```
+
+### 7.5 Sinkhorn-Knopp Test Suite (`test_sinkhorn.py`)
+
+```python
+"""Sinkhorn-Knopp kernel tests."""
+
+import pytest
+import torch
+
+from mhc.cute_dsl.sinkhorn import sinkhorn_knopp
+from tests.conftest import sinkhorn_ref
+
+
+class TestSinkhornForward:
+    """Forward pass correctness tests."""
+    
+    @pytest.mark.parametrize("size", [8, 16, 32, 48, 64])  # Single block sizes
+    @pytest.mark.parametrize("num_iters", [5, 10, 20, 50])
+    def test_doubly_stochastic_property(self, size, num_iters, device, seed):
+        """Test output is doubly stochastic matrix."""
+        M = torch.rand(size, size, device=device) + 0.1
+        
+        out = sinkhorn_knopp(M, num_iters=num_iters)
+        
+        row_sums = out.sum(dim=1)
+        col_sums = out.sum(dim=0)
+        
+        torch.testing.assert_close(row_sums, torch.ones_like(row_sums), atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(col_sums, torch.ones_like(col_sums), atol=1e-4, rtol=1e-4)
+        assert (out >= 0).all(), "Output should be non-negative"
+
+    @pytest.mark.parametrize("size", [16, 32, 64])
+    def test_matches_reference(self, size, device, seed):
+        """Test output matches reference implementation."""
+        M = torch.rand(size, size, device=device) + 0.1
+        
+        out = sinkhorn_knopp(M, num_iters=20)
+        out_ref = sinkhorn_ref(M, num_iters=20)
+        
+        torch.testing.assert_close(out, out_ref, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.parametrize("M,N", [(16, 32), (32, 16), (24, 48)])  # Non-square
+    def test_non_square_matrices(self, M, N, device, seed):
+        """Test with non-square matrices."""
+        mat = torch.rand(M, N, device=device) + 0.1
+        
+        out = sinkhorn_knopp(mat, num_iters=20)
+        
+        assert out.shape == (M, N)
+        assert not torch.isnan(out).any()
+
+
+class TestSinkhornBackward:
+    """Backward pass tests."""
+    
+    @pytest.mark.parametrize("size", [8, 16, 32])
+    def test_gradient_exists(self, size, device, seed):
+        """Test that gradients flow through."""
+        M = (torch.rand(size, size, device=device) + 0.1).requires_grad_(True)
+        
+        out = sinkhorn_knopp(M, num_iters=10)
+        loss = out.sum()
+        loss.backward()
+        
+        assert M.grad is not None
+        assert not torch.isnan(M.grad).any()
+        assert not torch.isinf(M.grad).any()
+
+    def test_gradcheck(self, device, seed):
+        """Test gradients with torch.autograd.gradcheck."""
+        size = 8
+        M = (torch.rand(size, size, device=device, dtype=torch.float64) + 0.1).requires_grad_(True)
+        
+        def fn(x):
+            return sinkhorn_knopp(x, num_iters=5)
+        
+        torch.autograd.gradcheck(fn, (M,), eps=1e-4)
+
+
+class TestSinkhornNumericalStability:
+    """Numerical stability tests."""
+    
+    def test_large_values(self, device, seed):
+        """Test stability with large input values."""
+        size = 32
+        M = torch.rand(size, size, device=device) * 1000
+        
+        out = sinkhorn_knopp(M, num_iters=50)
+        
+        assert not torch.isnan(out).any()
+        assert not torch.isinf(out).any()
+
+    def test_small_values(self, device, seed):
+        """Test stability with small input values."""
+        size = 32
+        M = torch.rand(size, size, device=device) * 1e-6 + 1e-8
+        
+        out = sinkhorn_knopp(M, num_iters=20)
+        
+        assert not torch.isnan(out).any()
+        assert not torch.isinf(out).any()
+
+    def test_sparse_input(self, device, seed):
+        """Test with sparse-like input (many near-zero values)."""
+        size = 32
+        M = torch.rand(size, size, device=device)
+        M[M < 0.9] = 1e-8  # Make most values very small
+        
+        out = sinkhorn_knopp(M, num_iters=20)
+        
+        assert not torch.isnan(out).any()
+
+
+class TestSinkhornBatched:
+    """Batched operation tests."""
+    
+    @pytest.mark.parametrize("batch_size", [1, 4, 16])
+    def test_batched_forward(self, batch_size, device, seed):
+        """Test batched forward pass."""
+        size = 32
+        M = torch.rand(batch_size, size, size, device=device) + 0.1
+        
+        out = sinkhorn_knopp(M, num_iters=20)
+        
+        assert out.shape == (batch_size, size, size)
+        
+        # Check each batch element is doubly stochastic
+        for i in range(batch_size):
+            row_sums = out[i].sum(dim=1)
+            col_sums = out[i].sum(dim=0)
+            torch.testing.assert_close(row_sums, torch.ones_like(row_sums), atol=1e-4, rtol=1e-4)
+            torch.testing.assert_close(col_sums, torch.ones_like(col_sums), atol=1e-4, rtol=1e-4)
+```
+
+### 7.6 Stream Operations Test Suite (`test_stream_ops.py`)
+
+```python
+"""Stream operations kernel tests."""
+
+import pytest
+import torch
+
+from mhc.cute_dsl.stream_ops import stream_aggregate, stream_distribute_mix_add
+
+
+class TestStreamAggregate:
+    """Stream aggregation tests."""
+    
+    @pytest.mark.parametrize("B", [1, 8, 32])
+    @pytest.mark.parametrize("n", [2, 4, 8, 16])
+    @pytest.mark.parametrize("C", [64, 128, 256, 1024])
+    def test_forward_shape(self, B, n, C, device, seed):
+        """Test output shape is correct."""
+        inp = torch.randn(B, n, C, device=device, dtype=torch.bfloat16)
+        H_pre = torch.randn(n, device=device, dtype=torch.float32)
+        
+        out, H_activated = stream_aggregate(inp, H_pre)
+        
+        assert out.shape == (B, C)
+        assert H_activated.shape == (n,)
+
+    @pytest.mark.parametrize("n", [2, 4, 8])
+    def test_sigmoid_activation(self, n, device, seed):
+        """Test H weights are properly sigmoid-activated."""
+        B, C = 8, 128
+        inp = torch.randn(B, n, C, device=device, dtype=torch.bfloat16)
+        H_pre = torch.randn(n, device=device, dtype=torch.float32)
+        
+        _, H_activated = stream_aggregate(inp, H_pre)
+        
+        # Activated weights should be in (0, 1) due to sigmoid
+        assert (H_activated > 0).all()
+        assert (H_activated < 1).all()
+        
+        # Check against reference sigmoid
+        H_ref = torch.sigmoid(H_pre)
+        torch.testing.assert_close(H_activated, H_ref, atol=1e-5, rtol=1e-5)
+
+
+class TestStreamDistributeMixAdd:
+    """Stream distribute/mix/add tests."""
+    
+    @pytest.mark.parametrize("B", [1, 8, 32])
+    @pytest.mark.parametrize("n", [2, 4, 8])
+    @pytest.mark.parametrize("C", [64, 128, 256])
+    def test_forward_shape(self, B, n, C, device, seed):
+        """Test output shape is correct."""
+        x = torch.randn(B, C, device=device, dtype=torch.float32)
+        y_norm = torch.randn(B, C, device=device, dtype=torch.bfloat16)
+        H_post = torch.randn(n, device=device, dtype=torch.float32)
+        M = torch.randn(n, n, device=device, dtype=torch.float32)
+        
+        out, H_activated = stream_distribute_mix_add(x, y_norm, H_post, M)
+        
+        assert out.shape == (B, n, C)
+        assert H_activated.shape == (n,)
+
+
+class TestStreamOpsBackward:
+    """Backward pass tests for stream operations."""
+    
+    def test_aggregate_backward(self, device, seed):
+        """Test backward pass for stream_aggregate."""
+        B, n, C = 8, 4, 128
+        inp = torch.randn(B, n, C, device=device, dtype=torch.float32, requires_grad=True)
+        H_pre = torch.randn(n, device=device, dtype=torch.float32, requires_grad=True)
+        
+        out, _ = stream_aggregate(inp, H_pre)
+        loss = out.sum()
+        loss.backward()
+        
+        assert inp.grad is not None
+        assert H_pre.grad is not None
+        assert not torch.isnan(inp.grad).any()
+        assert not torch.isnan(H_pre.grad).any()
+```
+
+### 7.7 Integration Test Suite (`test_mhc_layer.py`)
+
+```python
+"""Full MHC layer integration tests."""
+
+import pytest
+import torch
+
+from mhc.cute_dsl.mhc_layer import MHCLayerDSL
+
+
+class TestMHCLayerForward:
+    """Forward pass integration tests."""
+    
+    @pytest.mark.parametrize("B", [1, 8, 32])
+    @pytest.mark.parametrize("n", [2, 4, 8])
+    @pytest.mark.parametrize("C", [64, 128, 256])
+    def test_forward_shape(self, B, n, C, device, seed):
+        """Test full layer forward produces correct shape."""
+        layer = MHCLayerDSL(hidden_dim=C, expansion_rate=n).to(device)
+        x = torch.randn(B, n, C, device=device)
+        
+        out = layer(x)
+        
+        assert out.shape == (B, n, C)
+        assert not torch.isnan(out).any()
+        assert not torch.isinf(out).any()
+
+    def test_deterministic(self, device, seed):
+        """Test layer is deterministic."""
+        B, n, C = 8, 4, 128
+        layer = MHCLayerDSL(hidden_dim=C, expansion_rate=n).to(device)
+        x = torch.randn(B, n, C, device=device)
+        
+        out1 = layer(x)
+        out2 = layer(x)
+        
+        torch.testing.assert_close(out1, out2)
+
+
+class TestMHCLayerBackward:
+    """Backward pass integration tests."""
+    
+    def test_gradient_flow(self, device, seed):
+        """Test gradients flow through all parameters."""
+        B, n, C = 8, 4, 128
+        layer = MHCLayerDSL(hidden_dim=C, expansion_rate=n).to(device)
+        x = torch.randn(B, n, C, device=device, requires_grad=True)
+        
+        out = layer(x)
+        loss = out.sum()
+        loss.backward()
+        
+        assert x.grad is not None
+        assert x.grad.norm() > 0, "Input gradient should be non-zero"
+        
+        for name, param in layer.named_parameters():
+            assert param.grad is not None, f"{name} has no gradient"
+            assert not torch.isnan(param.grad).any(), f"{name} has NaN gradient"
+
+
+class TestMHCLayerVsCUDA:
+    """Tests comparing CuTe DSL implementation to original CUDA."""
+    
+    @pytest.mark.parametrize("B,n,C", [(8, 4, 128), (32, 8, 256)])
+    def test_matches_cuda_forward(self, B, n, C, device, seed):
+        """Test DSL implementation matches original CUDA."""
+        from mhc import MHCLayer  # Original CUDA implementation
+        
+        # Create layers with same weights
+        layer_cuda = MHCLayer(hidden_dim=C, expansion_rate=n).to(device)
+        layer_dsl = MHCLayerDSL(hidden_dim=C, expansion_rate=n).to(device)
+        
+        # Copy weights
+        layer_dsl.load_state_dict(layer_cuda.state_dict())
+        
+        x = torch.randn(B, n, C, device=device)
+        
+        out_cuda = layer_cuda(x)
+        out_dsl = layer_dsl(x)
+        
+        torch.testing.assert_close(out_dsl, out_cuda, atol=1e-2, rtol=1e-2)
+```
+
+### 7.8 Benchmark Suite
+
+```python
+"""Performance benchmarks for CuTe DSL kernels."""
+
+import pytest
 import torch
 import time
-from mhc.cute_dsl import rmsnorm, sinkhorn
-from mhc import ops as cuda_ops
+from typing import Callable
 
-def benchmark_rmsnorm(B, C, warmup=10, iters=100):
-    inp = torch.randn(B, C, device='cuda', dtype=torch.bfloat16)
-    weight = torch.randn(C, device='cuda', dtype=torch.bfloat16)
+
+def benchmark_kernel(
+    fn: Callable,
+    *args,
+    warmup: int = 10,
+    iters: int = 100,
+    **kwargs
+) -> float:
+    """Benchmark a kernel function.
     
+    Returns:
+        Average execution time in milliseconds.
+    """
     # Warmup
     for _ in range(warmup):
-        _ = rmsnorm.rmsnorm_forward_dsl(inp, weight, 1e-5)
-        _ = cuda_ops.rmsnorm(inp, weight, 1e-5)
+        fn(*args, **kwargs)
     torch.cuda.synchronize()
     
-    # Benchmark DSL
+    # Benchmark
     start = time.perf_counter()
     for _ in range(iters):
-        _ = rmsnorm.rmsnorm_forward_dsl(inp, weight, 1e-5)
+        fn(*args, **kwargs)
     torch.cuda.synchronize()
-    dsl_time = (time.perf_counter() - start) / iters * 1000
     
-    # Benchmark CUDA
-    start = time.perf_counter()
-    for _ in range(iters):
-        _ = cuda_ops.rmsnorm(inp, weight, 1e-5)
-    torch.cuda.synchronize()
-    cuda_time = (time.perf_counter() - start) / iters * 1000
+    return (time.perf_counter() - start) / iters * 1000
+
+
+class TestRMSNormPerformance:
+    """RMSNorm performance benchmarks."""
     
-    print(f"B={B}, C={C}: DSL={dsl_time:.3f}ms, CUDA={cuda_time:.3f}ms, "
-          f"ratio={dsl_time/cuda_time:.2f}x")
+    @pytest.mark.benchmark
+    @pytest.mark.parametrize("N", [1024, 4096, 16384, 65536])
+    @pytest.mark.parametrize("M", [32, 1024, 8192])
+    def test_rmsnorm_performance(self, M, N, device, benchmark):
+        """Benchmark RMSNorm against CUDA baseline."""
+        from mhc.cute_dsl.rmsnorm import rmsnorm as rmsnorm_dsl
+        from mhc import rmsnorm as rmsnorm_cuda
+        
+        x = torch.randn(M, N, device=device, dtype=torch.bfloat16)
+        weight = torch.randn(N, device=device, dtype=torch.float32)
+        
+        time_dsl = benchmark_kernel(rmsnorm_dsl, x, weight)
+        time_cuda = benchmark_kernel(rmsnorm_cuda, x, weight)
+        
+        ratio = time_dsl / time_cuda
+        
+        # Calculate memory bandwidth
+        bytes_transferred = M * N * 2 * 2  # Read input + write output, bf16
+        bandwidth_dsl = bytes_transferred / (time_dsl / 1000) / 1e12  # TB/s
+        
+        print(f"M={M}, N={N}: DSL={time_dsl:.3f}ms, CUDA={time_cuda:.3f}ms, "
+              f"ratio={ratio:.2f}x, bandwidth={bandwidth_dsl:.2f} TB/s")
+        
+        # Performance target: within 10% of CUDA
+        assert ratio < 1.1, f"DSL is {ratio:.2f}x slower than CUDA"
+
+
+# Run benchmarks with: pytest tests/benchmarks/ -v --benchmark
+```
+
+### 7.9 Running Tests
+
+```bash
+# Run all tests
+pytest tests/test_cute_dsl/ -v
+
+# Run specific test file
+pytest tests/test_cute_dsl/test_rmsnorm.py -v
+
+# Run with coverage
+pytest tests/test_cute_dsl/ --cov=mhc.cute_dsl --cov-report=html
+
+# Run only fast tests (skip slow parametric tests)
+pytest tests/test_cute_dsl/ -v -m "not slow"
+
+# Run benchmarks
+pytest tests/benchmarks/ -v --benchmark
+
+# Run with specific GPU
+CUDA_VISIBLE_DEVICES=0 pytest tests/test_cute_dsl/ -v
+
+# Parallel execution
+pytest tests/test_cute_dsl/ -v -n auto
+```
+
+### 7.10 CI Configuration (`.github/workflows/test.yml`)
+
+```yaml
+name: CuTe DSL Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: [self-hosted, gpu]
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install dependencies
+        run: pip install -e '.[dev]'
+      
+      - name: Run correctness tests
+        run: pytest tests/test_cute_dsl/ -v --tb=short
+      
+      - name: Run performance regression tests
+        run: pytest tests/benchmarks/ -v --benchmark --benchmark-compare
 ```
 
 ---
